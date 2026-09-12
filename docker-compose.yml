@@ -12,11 +12,19 @@
 # PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://...
 name: hedgetracker
 
+# One image, built from this repo, shared by every service below.
+# `hedgetracker:dev` is a local tag with no registry behind it, so
+# `pull_policy: build` tells Compose to build instead of first looking for
+# docker.io/library/hedgetracker:dev and warning that it does not exist.
+x-image: &image
+  build: .
+  image: hedgetracker:dev
+  pull_policy: build
+
 # Shared by the worker and the one-shot CLI: same network and lake, so a run
 # started either way lands in the same Parquet partitions.
 x-app: &app
-  build: .
-  image: hedgetracker:dev
+  <<: *image
   environment:
     PREFECT_API_URL: http://prefect-server:4200/api
     SEC_IDENTITY_EMAIL: ${SEC_IDENTITY_EMAIL:-mark@gmail.com}
@@ -31,8 +39,7 @@ x-app: &app
 
 services:
   prefect-server:
-    build: .
-    image: hedgetracker:dev
+    <<: *image
     command: ["prefect", "server", "start", "--host", "0.0.0.0"]
     environment:
       # The UI runs in the browser, so it reaches the API on the published port.
