@@ -124,6 +124,53 @@ incomplete quarter therefore never looks like a completed one, and because write
 are atomic per filer, re-running the same window is the fix — it is idempotent and
 overwrites each file with identical bytes.
 
+## Docker Compose
+
+`docker-compose.yml` runs the whole harness — Prefect server, worker and flows —
+from one image built out of this repo, so the server, the worker and the CLI all
+share the `uv.lock` versions of Prefect and `edgartools`.
+
+| Service | Role |
+| --- | --- |
+| `prefect-server` | Prefect 3 API + UI on <http://localhost:4200>, backed by SQLite on the `prefect-data` volume |
+| `worker` | creates the `process-pool` work pool, deploys `prefect.yaml`, then polls the pool |
+| `cli` | one-shot `hedgetracker` run; only started through the `cli` profile |
+
+```bash
+cp .env.example .env             # optional: set SEC_IDENTITY_EMAIL here
+docker compose up -d --build     # server + worker
+open http://localhost:4200       # Prefect UI
+```
+
+The worker registers the `13f-quarterly` deployment on startup, so a run is one
+command (or one click in the UI):
+
+```bash
+docker compose exec worker \
+  prefect deployment run '13F-HR Extraction Pipeline/13f-quarterly' --param limit=2
+```
+
+The deployment defaults to `limit: 5` to stay polite to EDGAR; override it per run
+with `--param limit=...` (and/or `--param year=... --param quarter=...`). Runs land
+in the `lake` volume (`/data/lake` in the containers, Hive partitions as
+described above) and `edgartools`' HTTP cache lives on the `edgar-cache` volume,
+so re-running the same window is fast.
+
+`.env` supplies `SEC_IDENTITY_EMAIL` and `EDGAR_HTTP_TIMEOUT` (the same variables
+and defaults as `settings.py`) to the worker and the one-shot CLI. A *deployment*
+run takes its parameters from `prefect.yaml`, which ships the test identity — pass
+`--param user_email=you@example.com` when running one for real, and see
+[`PRD.md`](PRD.md) for the SEC contact-address requirement.
+
+To run without the server at all:
+
+```bash
+docker compose --profile cli run --rm cli run --year 2024 --quarter 3 --limit 5
+```
+
+`docker compose down` stops the stack; add `-v` to also drop the lake, the EDGAR
+cache and the Prefect database.
+
 ## Testing
 
 ```bash
