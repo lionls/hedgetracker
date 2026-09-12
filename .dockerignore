@@ -1,0 +1,10 @@
+.git
+.gitignore
+.venv
+data
+.prefect
+.env
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache

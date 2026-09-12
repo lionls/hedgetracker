@@ -1,0 +1,80 @@
+# Local Prefect server + worker for exercising the 13F flows end to end.
+#
+#   docker compose up -d --build     # server + worker, built from this repo
+#   open http://localhost:4200       # Prefect UI
+#
+# See the "Docker Compose" section of README.md for triggering runs.
+#
+# Everything runs one image built from this repo, so the server, the worker and
+# the CLI share the exact Prefect and edgartools versions from uv.lock. The server
+# uses SQLite on a volume: right for a throwaway harness, and swapping in Postgres
+# only means adding a service and setting
+# PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://...
+name: hedgetracker
+
+# Shared by the worker and the one-shot CLI: same network and lake, so a run
+# started either way lands in the same Parquet partitions.
+x-app: &app
+  build: .
+  image: hedgetracker:dev
+  environment:
+    PREFECT_API_URL: http://prefect-server:4200/api
+    SEC_IDENTITY_EMAIL: ${SEC_IDENTITY_EMAIL:-mark@gmail.com}
+    HEDGETRACKER_BASE_DIR: /data/lake
+    EDGAR_HTTP_TIMEOUT: ${EDGAR_HTTP_TIMEOUT:-60}
+  volumes:
+    - lake:/data
+    - edgar-cache:/root/.edgar
+  depends_on:
+    prefect-server:
+      condition: service_healthy
+
+services:
+  prefect-server:
+    build: .
+    image: hedgetracker:dev
+    command: ["prefect", "server", "start", "--host", "0.0.0.0"]
+    environment:
+      # The UI runs in the browser, so it reaches the API on the published port.
+      PREFECT_UI_API_URL: http://localhost:4200/api
+      PREFECT_SERVER_ANALYTICS_ENABLED: "false"
+    volumes:
+      # Default location of prefect.db; keeps runs across restarts.
+      - prefect-data:/root/.prefect
+    ports:
+      - "4200:4200"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request as u;
+          u.urlopen('http://127.0.0.1:4200/api/health').read()"
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  worker:
+    <<: *app
+    # A deployment can only target an existing work pool, and both steps are
+    # idempotent, so they are safe to repeat on every restart. A non-login shell
+    # keeps the image's PATH (a login shell would replace it).
+    command:
+      - bash
+      - -c
+      - >-
+        prefect work-pool create process-pool --type process || true;
+        prefect deploy --all;
+        exec prefect worker start -p process-pool --type process
+
+  # One-shot CLI, not started by `up`: `docker compose --profile cli run --rm cli`.
+  cli:
+    <<: *app
+    profiles: ["cli"]
+    entrypoint: ["hedgetracker"]
+    command: ["run", "--year", "2024", "--quarter", "3", "--limit", "5"]
+
+volumes:
+  lake:
+  edgar-cache:
+  prefect-data:

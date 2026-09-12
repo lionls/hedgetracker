@@ -1,0 +1,31 @@
+# Deployment definitions for `prefect deploy --all`, which the compose worker
+# runs on start-up. The schedule is intentionally empty: these run on demand.
+name: hedgetracker
+prefect-version: 3.8.5
+
+# The worker image already contains this code, and a process work pool runs flows
+# in the worker's own filesystem, so no build/push/pull steps are needed.
+build: null
+push: null
+pull: null
+
+deployments:
+  - name: 13f-quarterly
+    description: >-
+      Extract one EDGAR quarterly index window of 13F-HR filings into the Parquet
+      data lake, partitioned by each filing's report period.
+    entrypoint: src/hedgetracker/flows/sec_13f.py:extract_quarterly_13f
+    tags:
+      - sec
+      - 13f
+    work_pool:
+      name: process-pool
+    # A small default window keeps an accidental trigger polite to the SEC; pass
+    # --param limit=... (or null for a whole quarter) when running.
+    # user_email is the test identity from settings.py: override it with
+    # --param user_email=... before a real run, the SEC wants a reachable address.
+    parameters:
+      user_email: mark@gmail.com
+      year: 2024
+      quarter: 3
+      limit: 5
