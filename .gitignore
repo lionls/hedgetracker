@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Data lake output (partitioned Parquet)
+data/
+
+# Prefect local state / secrets
+.prefect/
+.env
