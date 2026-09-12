@@ -156,8 +156,9 @@ docker compose exec worker \
 The deployment defaults to `limit: 5` to stay polite to EDGAR; override it per run
 with `--param limit=...` (and/or `--param year=... --param quarter=...`). Runs land
 in the `lake` volume (`/data/lake` in the containers, Hive partitions as
-described above) and `edgartools`' HTTP cache lives on the `edgar-cache` volume,
-so re-running the same window is fast.
+described above; see [Inspecting the lake from the
+host](#inspecting-the-lake-from-the-host) to read them) and `edgartools`' HTTP
+cache lives on the `edgar-cache` volume, so re-running the same window is fast.
 
 `.env` supplies `SEC_IDENTITY_EMAIL` and `EDGAR_HTTP_TIMEOUT` (the same variables
 and defaults as `settings.py`) to the worker and the one-shot CLI. A *deployment*
@@ -173,6 +174,49 @@ docker compose --profile cli run --rm cli run --year 2024 --quarter 3 --limit 5
 
 `docker compose down` stops the stack; add `-v` to also drop the lake, the EDGAR
 cache and the Prefect database.
+
+### Inspecting the lake from the host
+
+The lake is a named volume, so it is not a host directory. Read it inside the
+image, where `pandas`/`pyarrow` are already installed:
+
+```bash
+docker compose exec worker find /data/lake -name '*.parquet'
+docker compose exec worker python -c "import pandas as pd; print(pd.read_parquet('/data/lake'))"
+```
+
+Or copy it out — the copy keeps the `year=`/`quarter=` layout, so the repo's own
+environment can read it, and the files land owned by you:
+
+```bash
+docker compose cp worker:/data/lake/. ./data/lake
+uv run python -c "import pandas as pd; print(pd.read_parquet('data/lake'))"
+```
+
+To skip the copy and have runs write into the repo, mount the lake over the volume
+with an override file that leaves `docker-compose.yml` untouched:
+
+```yaml
+# docker-compose.override.yml — optional: keep the lake on the host
+services:
+  worker:
+    volumes:
+      - ./data/lake:/data/lake
+  cli:
+    volumes:
+      - ./data/lake:/data/lake
+```
+
+```bash
+docker compose up -d             # recreates the worker with the extra mount
+```
+
+Runs then land in `data/lake` — the same directory the local CLI uses by default,
+and `data/` is already gitignored. Containers write as root, so on Linux
+`sudo chown -R "$USER" data/lake` is needed before running the CLI against that
+directory; Docker Desktop maps the files to your own user, so macOS needs nothing.
+A bind-mounted lake is also outside Compose's control: `down -v` drops the
+volumes, not that directory.
 
 ## Testing
 
