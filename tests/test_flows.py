@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import date
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -75,6 +76,26 @@ UNREADABLE_SUBMISSION = FakeAttachments()
 
 
 @dataclass(frozen=True)
+class FakeHomepage:
+    """Stands in for ``edgar.filing_homepage.FilingHomepage``.
+
+    ``period_of_report`` is what the filing's index page states, which is how an
+    already-extracted filing is recognised without downloading its submission; the
+    extraction has to cope with a page that states nothing.
+    """
+
+    period_of_report: str | None = None
+
+
+class UnreadableHomepage:
+    """Stands in for an index page the SEC answered with an error page."""
+
+    @property
+    def period_of_report(self) -> str:
+        raise RuntimeError("SEC answered the index page request with an error page")
+
+
+@dataclass(frozen=True)
 class FakeFiling:
     """Stands in for ``edgar.Filing``, so the real ``data.holdings_frame`` runs."""
 
@@ -85,6 +106,7 @@ class FakeFiling:
     report: FakeReport
     form: str = "13F-HR"
     attachments: FakeAttachments = INDEXED_TABLE
+    homepage: FakeHomepage | UnreadableHomepage = FakeHomepage()
 
     def obj(self) -> FakeReport:
         return self.report
@@ -96,6 +118,7 @@ def _filing(
     report_period: str,
     infotable,
     attachments: FakeAttachments = INDEXED_TABLE,
+    index_page: FakeHomepage | UnreadableHomepage | None = None,
 ) -> FakeFiling:
     return FakeFiling(
         cik=cik,
@@ -106,6 +129,9 @@ def _filing(
             infotable=infotable, report_period=report_period, accession_number=accession_no
         ),
         attachments=attachments,
+        homepage=(
+            FakeHomepage(period_of_report=report_period) if index_page is None else index_page
+        ),
     )
 
 
@@ -140,6 +166,7 @@ def test_extracts_every_filing_and_reports_a_summary(tmp_path, sec_edgar):
         "filings": 3,
         "amendments_skipped": 7,
         "written": 2,
+        "skipped_existing": 0,
         "skipped_no_holdings": 1,
         "holdings_rows": 2,
     }
@@ -175,21 +202,76 @@ def test_written_files_conform_to_the_schema_and_to_their_partition(tmp_path, se
         assert path.parent.name == f"quarter={quarter}"
 
 
-def test_rerunning_the_same_window_changes_nothing(tmp_path, sec_edgar):
+def test_rerunning_a_window_skips_what_the_lake_already_holds(tmp_path, sec_edgar):
+    """An accepted filing does not change, so a second run leaves its file alone."""
     first = sec_13f.extract_quarterly_13f(
         user_email="mark@gmail.com", year=2024, quarter=3, base_dir=tmp_path
     )
-    before = {path: pq.read_table(path).to_pandas() for path in sorted(tmp_path.rglob("*.parquet"))}
+    before = {path: path.stat().st_mtime_ns for path in sorted(tmp_path.rglob("*.parquet"))}
 
     second = sec_13f.extract_quarterly_13f(
         user_email="mark@gmail.com", year=2024, quarter=3, base_dir=tmp_path
     )
 
-    assert first == second
-    after = {path: pq.read_table(path).to_pandas() for path in sorted(tmp_path.rglob("*.parquet"))}
-    assert set(after) == set(before)
-    for path, holdings in after.items():
-        assert holdings.equals(before[path])
+    assert first["written"] == 2
+    # The two extracted filings are skipped, the third still reports no holdings.
+    assert second == {
+        **first,
+        "written": 0,
+        "skipped_existing": 2,
+        "skipped_no_holdings": 1,
+        "holdings_rows": 0,
+    }
+    # The same files, untouched: a rewrite would move their timestamps.
+    assert {path: path.stat().st_mtime_ns for path in sorted(tmp_path.rglob("*.parquet"))} == before
+
+
+def test_an_already_extracted_filing_is_not_read_again(tmp_path, monkeypatch, sec_edgar):
+    """Skipping has to avoid the submission download, not just the write."""
+    sec_13f.extract_quarterly_13f(
+        user_email="mark@gmail.com", year=2024, quarter=3, base_dir=tmp_path
+    )
+
+    read: list[str] = []
+    real_holdings_frame = data.holdings_frame
+
+    def recording_holdings_frame(filing):
+        read.append(filing.accession_no)
+        return real_holdings_frame(filing)
+
+    monkeypatch.setattr(data, "holdings_frame", recording_holdings_frame)
+
+    summary = sec_13f.extract_quarterly_13f(
+        user_email="mark@gmail.com", year=2024, quarter=3, base_dir=tmp_path
+    )
+
+    # Only the filing that has no file yet is read; the extracted two are not.
+    assert read == ["0002034595-24-000001"]
+    assert summary["skipped_existing"] == 2
+
+
+@pytest.mark.parametrize("index_page", [FakeHomepage(), UnreadableHomepage()])
+def test_a_filing_without_a_usable_index_page_is_extracted_anyway(
+    tmp_path, monkeypatch, infotable, index_page
+):
+    """Without a stated period there is nothing to skip on, so the filing is read."""
+    filing = _filing(
+        1661222,
+        "0001661222-24-000003",
+        "2024-06-30",
+        infotable(),
+        index_page=index_page,
+    )
+    monkeypatch.setattr(data, "configure_identity", lambda email: None)
+    monkeypatch.setattr(data, "quarterly_13f_filings", lambda year, quarter: ([filing], 0))
+
+    summary = sec_13f.extract_quarterly_13f(
+        user_email="mark@gmail.com", year=2024, quarter=3, base_dir=tmp_path
+    )
+
+    assert summary["written"] == 1
+    assert summary["skipped_existing"] == 0
+    assert (tmp_path / "13f_holdings" / "year=2024" / "quarter=2" / "0001661222.parquet").exists()
 
 
 def test_limit_caps_how_many_filings_are_extracted(tmp_path, sec_edgar):
@@ -296,3 +378,133 @@ def test_a_filing_reporting_no_holdings_is_skipped_rather_than_failed():
     )
 
     assert data.holdings_frame(filing) is None
+
+
+def test_quarter_windows_covers_every_year_and_quarter_that_has_closed():
+    """The sweep is the cross product of the requested years and quarters, oldest first."""
+    assert data.quarter_windows(2024, 2025, today=date(2026, 1, 1)) == [
+        (2024, 1),
+        (2024, 2),
+        (2024, 3),
+        (2024, 4),
+        (2025, 1),
+        (2025, 2),
+        (2025, 3),
+        (2025, 4),
+    ]
+
+
+def test_quarter_windows_opens_at_the_quarter_end_and_not_before():
+    """A quarter is a window only once it has ended; the day it ends it still is not."""
+    assert data.quarter_windows(2026, today=date(2026, 9, 12)) == [(2026, 1), (2026, 2)]
+    assert data.quarter_windows(2026, today=date(2026, 9, 30)) == [(2026, 1), (2026, 2)]
+    assert data.quarter_windows(2026, today=date(2026, 10, 1)) == [
+        (2026, 1),
+        (2026, 2),
+        (2026, 3),
+    ]
+
+
+def test_quarter_windows_honours_a_quarter_subset():
+    assert data.quarter_windows(2025, 2025, quarters=(4, 2), today=date(2026, 1, 1)) == [
+        (2025, 2),
+        (2025, 4),
+    ]
+
+
+def test_quarter_windows_rejects_years_edgar_does_not_index_and_inverted_ranges():
+    with pytest.raises(ValueError, match="index starts in 1993"):
+        data.quarter_windows(data.FIRST_INDEXED_YEAR - 1, today=date(2026, 1, 1))
+
+    with pytest.raises(ValueError, match="before start_year"):
+        data.quarter_windows(2025, 2024, today=date(2026, 1, 1))
+
+
+def test_backfill_sweeps_every_closed_window_and_aggregates_the_totals(tmp_path, sec_edgar):
+    """Four windows of 2024 over the same fixtures: the first writes, the rest skip."""
+    summary = sec_13f.backfill_13f(
+        user_email="mark@gmail.com", start_year=2024, end_year=2024, base_dir=tmp_path
+    )
+
+    assert summary == {
+        "base_dir": str(tmp_path),
+        "start_year": 2024,
+        "end_year": 2024,
+        "windows": 4,
+        "windows_swept": 4,
+        "filings": 12,
+        "written": 2,
+        "skipped_existing": 6,
+        "holdings_rows": 2,
+        "per_window": [
+            {
+                "year": 2024,
+                "quarter": 1,
+                "written": 2,
+                "skipped_existing": 0,
+                "holdings_rows": 2,
+            },
+            *[
+                {
+                    "year": 2024,
+                    "quarter": quarter,
+                    "written": 0,
+                    "skipped_existing": 2,
+                    "holdings_rows": 0,
+                }
+                for quarter in (2, 3, 4)
+            ],
+        ],
+    }
+    # Both reporters wrote onto the same partition once; the sweep did not rewrite them.
+    assert len(list(tmp_path.rglob("*.parquet"))) == 2
+
+
+def test_backfill_sweeps_only_the_requested_quarters(tmp_path, sec_edgar):
+    summary = sec_13f.backfill_13f(
+        user_email="mark@gmail.com",
+        start_year=2024,
+        end_year=2024,
+        quarters=(2, 4),
+        base_dir=tmp_path,
+    )
+
+    assert [(entry["year"], entry["quarter"]) for entry in summary["per_window"]] == [
+        (2024, 2),
+        (2024, 4),
+    ]
+
+
+def test_backfill_keeps_going_after_a_failing_window_and_names_it(tmp_path, monkeypatch, sec_edgar):
+    """A window that fails must not hide the windows that succeeded, and must fail the run."""
+    passing_window = data.quarterly_13f_filings
+
+    def flaky_window(year, quarter):
+        if (year, quarter) == (2024, 2):
+            raise RuntimeError("SEC index unavailable")
+        return passing_window(year, quarter)
+
+    monkeypatch.setattr(data, "quarterly_13f_filings", flaky_window)
+
+    with pytest.raises(RuntimeError, match=r"1 of 4 index windows failed \(first: 2024Q2"):
+        sec_13f.backfill_13f(
+            user_email="mark@gmail.com", start_year=2024, end_year=2024, base_dir=tmp_path
+        )
+
+    # The other three windows still reached the lake.
+    assert (tmp_path / "13f_holdings" / "year=2024" / "quarter=2" / "0001661222.parquet").exists()
+
+
+def test_backfill_refuses_a_range_whose_windows_have_not_closed(tmp_path, sec_edgar):
+    """A range with nothing to read yet is an error, not an empty success."""
+    next_year = date.today().year + 1
+
+    with pytest.raises(ValueError, match="no closed EDGAR index window"):
+        sec_13f.backfill_13f(
+            user_email="mark@gmail.com",
+            start_year=next_year,
+            end_year=next_year,
+            base_dir=tmp_path,
+        )
+
+    assert not list(tmp_path.rglob("*.parquet"))

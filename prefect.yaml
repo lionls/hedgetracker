@@ -29,3 +29,26 @@ deployments:
       year: 2024
       quarter: 3
       limit: 5
+
+  - name: 13f-backfill
+    description: >-
+      Sweep every closed EDGAR quarterly index window in a range of years, one
+      subflow run per quarter, oldest first. Defaults to the XML era (2013
+      onward); pass start_year=1993 to also read the tables embedded in older
+      submissions.
+    entrypoint: src/hedgetracker/flows/sec_13f.py:backfill_13f
+    tags:
+      - sec
+      - 13f
+      - backfill
+    work_pool:
+      name: process-pool
+    # end_year null means "the current year"; windows that have not closed yet are
+    # skipped. A full-history sweep is hours of SEC traffic — trigger it when the
+    # SEC is quiet, and re-run single quarters with 13f-quarterly if one fails.
+    # user_email is the test identity from settings.py: override with
+    # --param user_email=... before a real run.
+    parameters:
+      user_email: mark@gmail.com
+      start_year: 2013
+      end_year: null
