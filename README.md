@@ -128,7 +128,10 @@ overwrites each file with identical bytes.
 
 `docker-compose.yml` runs the whole harness — Prefect server, worker and flows —
 from one image built out of this repo, so the server, the worker and the CLI all
-share the `uv.lock` versions of Prefect and `edgartools`.
+share the `uv.lock` versions of Prefect and `edgartools`. That image is a purely
+local tag (`hedgetracker:dev`) — nothing is pulled from a registry, and
+`pull_policy: build` keeps Compose from going looking for it on Docker Hub — so
+`docker compose up -d --build` is the whole setup.
 
 | Service | Role |
 | --- | --- |
