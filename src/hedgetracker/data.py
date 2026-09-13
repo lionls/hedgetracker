@@ -6,6 +6,9 @@ and the extraction logic stays testable without a flow run.
 
 from __future__ import annotations
 
+import calendar
+from collections.abc import Iterable
+from datetime import date
 from typing import Final
 
 import pandas as pd
@@ -24,6 +27,17 @@ _INFORMATION_TABLE_SELECTORS: Final[tuple[str, ...]] = (
     "document_type=='INFORMATION TABLE' and document.lower().endswith('.xml')",
     "description=='FORM 13F' or description=='INFORMATION TABLE'",
 )
+
+#: First year covered by EDGAR's quarterly full index, so the earliest ``year``
+#: ``get_filings`` can serve.
+FIRST_INDEXED_YEAR = 1993
+
+#: First year whose 13F-HR filings carry an XML information table; older filings
+#: embed the table in the submission itself (see ``_INFORMATION_TABLE_SELECTORS``).
+FIRST_XML_INFORMATION_TABLE_YEAR = 2013
+
+#: Every quarter of the year, in filing order.
+QUARTERS: Final[tuple[int, ...]] = (1, 2, 3, 4)
 
 
 class SECDocumentUnavailable(RuntimeError):
@@ -61,6 +75,46 @@ def quarterly_13f_filings(year: int, quarter: int) -> tuple[list[Filing], int]:
     return originals, len(filings) - len(originals)
 
 
+def quarter_end(year: int, quarter: int) -> date:
+    """Return the last calendar day of ``year``/``quarter``."""
+    if quarter not in QUARTERS:
+        raise ValueError(f"quarter must be one of {QUARTERS}, got {quarter!r}")
+    last_month = 3 * quarter
+    return date(year, last_month, calendar.monthrange(year, last_month)[1])
+
+
+def quarter_windows(
+    start_year: int,
+    end_year: int | None = None,
+    quarters: Iterable[int] = QUARTERS,
+    today: date | None = None,
+) -> list[tuple[int, int]]:
+    """Return the EDGAR index windows to sweep from ``start_year`` to ``end_year``.
+
+    Windows come back oldest first, as ``(year, quarter)`` pairs, and only once
+    they have closed: EDGAR's quarterly index is complete only after the quarter
+    ends, whereas a quarter still in progress would contribute just the filings
+    that have arrived so far. ``end_year`` defaults to the year of ``today`` (the
+    current day by default), and ``quarters`` selects which quarters of each year
+    to include.
+    """
+    day = today or date.today()
+    last_year = day.year if end_year is None else end_year
+    if start_year < FIRST_INDEXED_YEAR:
+        raise ValueError(
+            f"EDGAR's quarterly index starts in {FIRST_INDEXED_YEAR}, so {start_year} has no "
+            "filings to read"
+        )
+    if last_year < start_year:
+        raise ValueError(f"end_year {last_year} is before start_year {start_year}")
+    return [
+        (year, quarter)
+        for year in range(start_year, last_year + 1)
+        for quarter in sorted(set(quarters))
+        if quarter_end(year, quarter) < day
+    ]
+
+
 def _information_table_document(filing: Filing) -> Attachment | None:
     """Return the document holding a filing's positions, or ``None`` if it has none."""
     attachments = filing.attachments
@@ -93,6 +147,24 @@ def _refetch(filing: Filing) -> Filing:
         filing_date=filing.filing_date,
         accession_no=filing.accession_no,
     )
+
+
+def report_period_from_index_page(filing: Filing) -> pd.Timestamp | None:
+    """Return the report period the filing's index page states, or ``None``.
+
+    The cover page and the information table both live in the submission, so
+    reading either means downloading it. The index page is a small HTML page that
+    states the same period, which is enough to recognise a filing that is already
+    in the lake without pulling the submission. ``None`` means the page did not
+    answer or stated no period: the caller then reads the filing the slow way
+    rather than guessing at its partition.
+    """
+    try:
+        period = filing.homepage.period_of_report
+    except Exception:
+        return None
+    timestamp = pd.to_datetime(period, errors="coerce")
+    return None if pd.isna(timestamp) else timestamp
 
 
 def holdings_frame(filing: Filing) -> pd.DataFrame | None:

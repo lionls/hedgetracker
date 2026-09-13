@@ -26,7 +26,12 @@ x-image: &image
 x-app: &app
   <<: *image
   environment:
-    PREFECT_API_URL: http://prefect-server:4200/api
+    # Override both to point the worker and the one-shot CLI at another Prefect
+    # instance: `PREFECT_API_URL=... PREFECT_API_KEY=... docker compose up -d
+    # --no-deps worker`. An unset key stays empty, which an unauthenticated
+    # server accepts.
+    PREFECT_API_URL: ${PREFECT_API_URL:-http://prefect-server:4200/api}
+    PREFECT_API_KEY: ${PREFECT_API_KEY:-}
     SEC_IDENTITY_EMAIL: ${SEC_IDENTITY_EMAIL:-mark@gmail.com}
     HEDGETRACKER_BASE_DIR: /data/lake
     EDGAR_HTTP_TIMEOUT: ${EDGAR_HTTP_TIMEOUT:-60}
