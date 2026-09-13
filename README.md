@@ -1,7 +1,8 @@
 # hedgetracker
 
 Prefect pipelines that track hedge fund fund flow by extracting quarterly
-13F-HR holdings from SEC EDGAR into a partitioned Parquet data lake.
+13F-HR holdings from SEC EDGAR into a partitioned Parquet data lake, plus the
+daily price bars those holdings are tracked against.
 
 See [`PRD.md`](PRD.md) for the product requirements.
 
@@ -34,8 +35,9 @@ src/hedgetracker/
 ├── schema.py            # EXPECTED_SCHEMA, enforce_schema(), ARROW_SCHEMA
 ├── storage.py           # Hive-style partition paths + atomic Parquet writes
 ├── settings.py          # env-backed configuration
-├── cli.py               # `hedgetracker run ...`
+├── cli.py               # `hedgetracker run|backfill|quotes ...`
 ├── data.py              # edgartools access helpers (identity, filing lookup)
+├── quotes.py            # Hugging Face minute bars → daily OHLCV bars
 └── flows/
     └── sec_13f.py       # extract_13f_holdings task + extract_quarterly_13f flow
 tests/                   # offline unit tests + `-m live` SEC integration tests
@@ -185,6 +187,116 @@ successful filings are written, and the flow then raises
 incomplete quarter therefore never looks like a completed one. Re-running the
 window is the fix, and it is a cheap one: filings already in the lake are skipped,
 so the re-run reads and writes only the gaps.
+
+## Daily price bars
+
+13F holdings are quarterly snapshots, so anything that measures what a position
+did between two filings needs prices. `quotes` folds the
+[`mito0o852/OHLCV-1m`](https://huggingface.co/datasets/mito0o852/OHLCV-1m) dataset
+— one Parquet file of **one-minute** US OHLCV bars per month, 411 files from
+`ohlcv_1992-01.parquet` to `ohlcv_2026-03.parquet`, 82 GB in total — into **one
+daily bar per ticker and session**, in a single Parquet file:
+
+```bash
+uv run hedgetracker quotes                        # 1992-01 through the current year
+uv run hedgetracker quotes --start-year 2024 --end-year 2024 --months 1,2
+uv run hedgetracker quotes --out /tmp/quotes.parquet --work-dir /tmp/quote-shards
+```
+
+| Flag | Required | Meaning |
+| --- | --- | --- |
+| `--start-year` | no | First year to fold (default `1992`, the first year upstream) |
+| `--end-year` | no | Last year to fold (default: the current year) |
+| `--months` | no | Months to fold in every year of the range, e.g. `1,2,12` (default: all twelve) |
+| `--out` | no | Destination Parquet file (default `{base_dir}/market/quotes_daily.parquet`) |
+| `--work-dir` | no | Directory holding the per-month shards (default `{base_dir}/market/shards`) |
+| `--force` | no | Re-fold months whose shard is already on disk |
+| `--workers` | no | Months folded in parallel (default `2`) |
+| `--threads` | no | DuckDB threads per connection (default `4`) |
+| `--memory-limit` | no | DuckDB memory limit per connection (default `4GB`) |
+| `--keep-shards` | no | Keep the per-month shards after a successful merge |
+| `--base-dir` | no | Data lake root, as for `run` |
+
+### What a daily bar means
+
+| Column | Type | Value |
+| --- | --- | --- |
+| `ticker` | `VARCHAR` | upstream symbol, as published |
+| `date` | `DATE` | the **New York** calendar date of the session |
+| `open` | `DOUBLE` | first print of the regular session — `arg_min(open, timestamp)` |
+| `high` | `DOUBLE` | `max(high)` over the regular session |
+| `low` | `DOUBLE` | `min(low)` over the regular session |
+| `close` | `DOUBLE` | last print of the regular session — `arg_max(close, timestamp)` |
+| `volume` | `DOUBLE` | upstream `volume` summed over the regular session |
+
+Four decisions are baked into that, and they are the ones that are easy to get
+wrong:
+
+* **Regular session only** — bars are kept when the exchange-local time is
+  `09:30:00` through `15:59:59` ET, so pre-market and after-hours prints (which
+  the source does carry, and which a UTC-date rollover would attribute to the
+  next day) never enter a daily bar. Volume is therefore regular-session volume,
+  not the full-day figure a data vendor would quote.
+* **Exchange-local dates** — rows are grouped by
+  `timezone('America/New_York', timestamp)::DATE`, not by the UTC date of the
+  timestamp. Both differ for after-hours prints, and a fixed UTC offset breaks
+  twice a year: 09:30 ET is 14:30 UTC under EST and 13:30 UTC under EDT. Because
+  the source partitions by UTC month while a session runs `13:30`-`21:00` UTC on
+  one UTC date in either regime, no session ever straddles a month boundary and
+  folding each month on its own is exact.
+* **Null-safe ends** — `arg_min`/`arg_max` skip nulls, so a month whose first or
+  last in-session print has a null `open`/`close` still produces that day's bar
+  instead of blanking it. A day whose every in-session print lacks the field
+  stays null.
+* **One row per ticker and session** — `GROUP BY ticker, date`, so a ticker with
+  a halt, a gap, or a single print still yields exactly one bar.
+
+A ticker that does not trade in a month simply has no rows for it; the dataset is
+sparse and has no forward-filled bars.
+
+### Streaming the source
+
+The source is 82 GB and is never copied: DuckDB reads the Hub Parquet files over
+HTTPS through its `httpfs` extension, one month at a time, and only the daily
+bars survive. The first run downloads that extension (and `icu`, if the DuckDB
+build has no timezone support of its own); later runs load it from disk.
+
+* **One shard per month**, `{work-dir}/quotes_YYYY-MM.parquet`, written
+  atomically. A month whose shard is already there is reused, so a run that was
+  interrupted — or a range that was folded earlier — pays only for the months it
+  does not have. `--force` re-folds them anyway, which is what a change to the
+  folding rules requires.
+* **Never a partial dataset**: every requested month is folded first and the
+  shards are merged only if all of them succeeded. A failure is reported as
+  `QuotesSourceError: N month(s) failed: <month> (<reason>)` with the shards left
+  on disk, so the rerun resumes; the destination keeps the previous dataset.
+* **Months upstream does not publish** are not an error as long as they are outside
+  the published span — the source runs `1992-01` to `2026-03`, so asking for
+  `1991-06` or `2026-04` reports them in `months_absent_upstream` and folds the
+  rest. A month missing *inside* the span, or a run whose every requested month is
+  unpublished, is an error: a gap in the input never becomes a silent gap in the
+  output.
+* The source carries a handful of exact `(ticker, timestamp)` duplicates per month
+  (6 in the 26,063,374 rows of `2024-01`). They are folded as they are, so such a
+  minute counts twice in that day's volume.
+* **After a successful merge** the work directory is removed, unless
+  `--keep-shards`.
+* **Proxies are applied by hand.** DuckDB reads `HTTP_PROXY`/`HTTPS_PROXY` itself
+  but cannot parse a proxy URL that carries credentials, and a value it cannot
+  parse makes the request stall instead of failing (observed here: no answer for
+  over 25 minutes). The ambient variables are therefore dropped and the proxy is
+  set on the connection the way DuckDB expects — host and port as `http_proxy`,
+  credentials as `http_proxy_username`/`http_proxy_password`. A missing or
+  unparseable proxy still means the direct connection.
+
+Because files are partitioned by UTC month and a session never crosses a UTC
+month boundary, `--months` is free to select any subset.
+
+The whole 1992-2026 sweep is a background job: 82 GB over HTTPS, and the rate
+depends mostly on the size of each month's file (`--workers 2` overlaps the
+downloads; the Hub, not the CPU, is the bottleneck). Progress goes to stderr, one
+line per month, and the JSON summary on stdout is the same shape as the 13F
+commands'.
 
 ## Docker Compose
 
@@ -387,7 +499,7 @@ run.
 
 ### Verification runs
 
-The offline suite passes (42 tests) and the live smoke run
+The offline suite passes (58 tests) and the live smoke run
 (`--year 2024 --quarter 3 --limit 25`, scratch lake) wrote 25 files / 3069 holding
 rows with no failures, spread over 11 report-period partitions
 (`2021Q4`-`2024Q2` — a Q3 2024 index window, so the partition is the filer's own
@@ -406,3 +518,21 @@ The sweep was verified end to end on a second Prefect server — the same image 
 subflows of one parent run on that instance, and a second sweep of the same range
 wrote nothing (`0 files, 4 filings already extracted`, every window reported
 complete) and left the lake byte-identical, checksums and timestamps included.
+
+The `quotes` fold was verified against the live dataset rather than a fixture:
+1992-01 and 1992-02 (two 31 MB files) folded in 10.5 s, and 2024-01 — 319 MB,
+26,063,374 minute rows, 20,221 tickers — in 37.7 s, giving 294,847 daily bars.
+Those three months were then recomputed from the upstream files with an
+independent query (correlated `ORDER BY ... LIMIT 1` subqueries where the module
+uses `arg_min`/`arg_max`) and compared bar for bar against the shards: 518,046
+daily bars, zero mismatches. The `AAPL` bars for 2024-01-02 and 2024-01-03 match a
+direct read of the minutes (`187.17/188.44/183.89/185.525` and
+`184.29/185.87/183.43/184.24`, volumes 63,793,826 and 45,009,448), and the fold
+reproduces that reading's independent totals for the month exactly: 294,847 bars
+over 20,221 tickers and 21 sessions. Reading 2024-01's timestamps in exchange time
+also shows how much the session filter removes: 749,073 prints before 09:30 ET,
+286,634 in the 16:00 ET hour, and 264,350 after it, none of which reach a bar.
+
+The first thirteen months of the full sweep (1992-01 through 1993-01, two workers)
+took 11 minutes, so the run is a background job that lives on its shards rather
+than on a single invocation; an interrupted sweep resumes where it stopped.
