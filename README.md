@@ -281,6 +281,12 @@ build has no timezone support of its own); later runs load it from disk.
   minute counts twice in that day's volume.
 * **After a successful merge** the work directory is removed, unless
   `--keep-shards`.
+* **The merge streams; it does not re-sort.** The shards are concatenated in date
+  order on a single thread. A global `ORDER BY ticker, date` over a hundred million
+  bars needs several GB of memory, or a scratch directory as large again as the
+  shards — the first attempt here spilled until the disk filled and the merge died
+  with an `IOException`. The dataset is therefore month-major, ordered by ticker
+  and date inside each month.
 * **Proxies are applied by hand.** DuckDB reads `HTTP_PROXY`/`HTTPS_PROXY` itself
   but cannot parse a proxy URL that carries credentials, and a value it cannot
   parse makes the request stall instead of failing (observed here: no answer for
@@ -296,7 +302,9 @@ The whole 1992-2026 sweep is a background job: 82 GB over HTTPS, and the rate
 depends mostly on the size of each month's file (`--workers 2` overlaps the
 downloads; the Hub, not the CPU, is the bottleneck). Progress goes to stderr, one
 line per month, and the JSON summary on stdout is the same shape as the 13F
-commands'.
+commands'. Stopping a sweep mid-1994 and running the same command again reported
+`387 month(s) to aggregate, 24 shard(s) reused, 9 month(s) beyond the published
+range` — the finished months cost nothing the second time.
 
 ## Docker Compose
 
@@ -533,6 +541,16 @@ over 20,221 tickers and 21 sessions. Reading 2024-01's timestamps in exchange ti
 also shows how much the session filter removes: 749,073 prints before 09:30 ET,
 286,634 in the 16:00 ET hour, and 264,350 after it, none of which reach a bar.
 
-The first thirteen months of the full sweep (1992-01 through 1993-01, two workers)
-took 11 minutes, so the run is a background job that lives on its shards rather
-than on a single invocation; an interrupted sweep resumes where it stopped.
+A two-worker sweep folds the 1990s files at roughly ten months per minute (about
+five seconds each, ~2 MB of shard) and the 2020s files — 319 to 442 MB each — at
+two to three months per minute, so the 411 months of the source take a bit over
+two hours.
+
+The whole sweep was then run against the live dataset: 411 months folded, the nine
+months of 2026 that upstream has not published yet reported as absent, and a merge
+that took 36 s and wrote 964 MB. The finished dataset holds **77,811,153 daily bars
+for 80,843 tickers, from 1992-01-02 to 2026-03-31**, with no null opens or closes.
+Its row count equals the sum of the 411 shard row counts exactly, every bar of
+1992-01 and 2024-01 matches its shard bar for bar, and the file's 630 row groups
+carry non-decreasing dates — which is what shows the merge streamed the months in
+order rather than shuffling them.

@@ -307,6 +307,7 @@ def aggregate_sql() -> str:
         + f"\nFROM read_parquet($uri)\nWHERE {session_time} >= TIME {_sql_literal(SESSION_START)}"
         + f"\n  AND {session_time} < TIME {_sql_literal(SESSION_CLOSE)}"
         + "\nGROUP BY ticker, date"
+        + "\nORDER BY ticker, date"
     )
 
 
@@ -342,14 +343,19 @@ def merge_shards(
     shards: Sequence[str | Path],
     destination: str | Path,
 ) -> Path:
-    """Concatenate daily shards into the final dataset, ordered by ticker then date."""
+    """Concatenate daily shards into the final dataset, one month after the other.
+
+    The shards are already ordered by ticker then date, and are decades of daily bars
+    when put together: a global ``ORDER BY`` over them needs more memory than the
+    machine has and spills gigabytes to ``temp_directory``, next to shards that are
+    just as large. Reading them in order on one thread keeps the merge streaming and
+    the output reproducible — month-major, ticker then date inside a month.
+    """
     if not shards:
         raise ValueError("merging needs at least one shard")
-    query = (
-        f"SELECT {', '.join(DAILY_COLUMNS)}\n"
-        f"FROM read_parquet({_sql_literal_list(shards)})\n"
-        "ORDER BY ticker, date"
-    )
+    con.execute("SET threads=1")
+    con.execute("SET preserve_insertion_order=true")
+    query = f"SELECT {', '.join(DAILY_COLUMNS)}\nFROM read_parquet({_sql_literal_list(shards)})"
     return _write_parquet(con, query, destination)
 
 

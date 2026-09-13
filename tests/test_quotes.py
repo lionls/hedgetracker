@@ -297,12 +297,17 @@ def test_months_outside_the_published_range_are_skipped_not_fatal(source: FakeSo
         source.build([quotes.Month(2024, 2)])
 
 
-def test_the_merged_dataset_is_typed_and_ordered_by_ticker_then_date(
-    source: FakeSource,
-) -> None:
+def test_the_merged_dataset_is_typed_and_grouped_by_month(source: FakeSource) -> None:
     january, july = quotes.Month(2024, 1), quotes.Month(2024, 7)
-    source.publish(january, [("BBB", utc(2024, 1, 16, 14, 30), 1.0, 1.0, 1.0, 1.0, 1.0)])
-    source.publish(july, [("AAA", utc(2024, 7, 5, 13, 30), 2.0, 2.0, 2.0, 2.0, 2.0)])
+    source.publish(
+        january,
+        [
+            ("BBB", utc(2024, 1, 16, 14, 30), 1.0, 1.0, 1.0, 1.0, 1.0),
+            ("AAA", utc(2024, 1, 17, 14, 30), 3.0, 3.0, 3.0, 3.0, 3.0),
+            ("AAA", utc(2024, 1, 16, 14, 30), 2.0, 2.0, 2.0, 2.0, 2.0),
+        ],
+    )
+    source.publish(july, [("AAA", utc(2024, 7, 5, 13, 30), 4.0, 4.0, 4.0, 4.0, 4.0)])
 
     summary = source.build([january, july])
 
@@ -317,9 +322,13 @@ def test_the_merged_dataset_is_typed_and_ordered_by_ticker_then_date(
         ("close", "double"),
         ("volume", "double"),
     ]
+    # One month after the other, each ordered by ticker then date; the file is not
+    # re-sorted globally, which would cost the whole dataset in memory.
     assert [(bar["ticker"], str(bar["date"])) for bar in source.bars()] == [
-        ("AAA", "2024-07-05"),
+        ("AAA", "2024-01-16"),
+        ("AAA", "2024-01-17"),
         ("BBB", "2024-01-16"),
+        ("AAA", "2024-07-05"),
     ]
-    assert summary["rows"] == 2
+    assert summary["rows"] == 4
     assert summary["output_bytes"] == (source.root / "quotes_daily.parquet").stat().st_size
