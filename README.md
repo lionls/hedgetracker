@@ -273,6 +273,63 @@ instance — `prefect deployment run '13F-HR Backfill/13f-backfill' --param ...`
 with the same `PREFECT_API_URL`, or its UI — while the Parquet lands in the
 worker's own `lake` volume, because the worker does the writing. The API key needs
 permission to create work pools and register deployments on the target workspace.
+Once the worker points there, shipping a change is a rebuild and a restart of that
+worker — see [Updating and redeploying](#updating-and-redeploying).
+
+#### Updating and redeploying
+
+Nothing in the stack is bind-mounted: the flows, `uv.lock` and `prefect.yaml` are
+baked into the image at build time, and the worker re-runs `prefect deploy --all`
+every time it starts (the `successfully created` lines in its log). An update is
+therefore always the same two steps, and they apply to whichever instance the
+worker points at:
+
+```bash
+docker compose build                  # new flows, new prefect.yaml, new uv.lock
+docker compose up -d --no-deps worker # recreated because the image changed,
+                                      # and re-registers both deployments
+```
+
+Against another instance those are the commands above with `PREFECT_API_URL` (and
+`PREFECT_API_KEY`) exported; an exported variable wins over `.env`. A parameter
+default, description, tag or entrypoint changed in `prefect.yaml` reaches the
+target the same way — `deploy --all` updates the deployment in place, same id, new
+`updated` timestamp, rather than adding a second one under the same name.
+
+To re-register the deployments without restarting a worker — after deleting one on
+the target, or to push the current definitions somewhere the worker is not pointed
+at — run the deploy step once in a `cli` container, which is also how to see what
+the target has:
+
+```bash
+export PREFECT_API_URL=... PREFECT_API_KEY=...
+docker compose --profile cli run --rm --entrypoint prefect cli deploy --all
+docker compose --profile cli run --rm --entrypoint prefect cli deployment ls
+```
+
+Two things `deploy --all` will not clean up for you:
+
+- Deployments are matched by name (`<flow name>/<deployment name>`). Renaming one
+  in `prefect.yaml` registers the new name and leaves the old deployment on the
+  target — `prefect deployment delete '<flow name>/<old name>'`, from a `cli`
+  container as above or in the target's UI.
+- The work pool is created with `|| true`, so restarting the worker never changes
+  an existing pool's settings. That takes `prefect work-pool update`.
+
+#### Restarting while runs are in flight
+
+The worker starts each flow run as a child of its own container, so recreating
+that container strands whatever was running: the process goes away with the
+worker while the run keeps its last state — `Running` on the target, or
+`Cancelling` if you cancel it — and nothing finishes it, because no worker is left
+to report on it. There is no drain, and the restarted worker takes new runs as
+soon as it is up, so restart when the pool is idle; for runs already stranded,
+`prefect flow-run cancel <id>` and `prefect flow-run delete <id>` (or the target's
+UI) get them out of the way.
+
+Re-running the window or the range afterwards is the recovery, and it is cheap:
+filings already in the lake are skipped, so a sweep cut off part-way writes only
+what it had not written yet.
 
 ### Inspecting the lake from the host
 
