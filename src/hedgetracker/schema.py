@@ -7,7 +7,8 @@ frame that reaches the data lake is passed through :func:`enforce_schema`, which
 
 * projects the frame onto :data:`EXPECTED_SCHEMA` (missing columns are created and
   filled with nulls, unexpected columns are dropped),
-* restores leading zeros that pandas stripped from all-digit CUSIPs, and
+* restores leading zeros that pandas stripped from all-digit CUSIPs,
+* resolves each holding's ``ticker`` from its CUSIP, and
 * casts every column to its exact nullable dtype, mapping placeholder tokens to
   real nulls.
 
@@ -23,6 +24,8 @@ from typing import Final
 import pandas as pd
 import pyarrow as pa
 
+from hedgetracker.reference import tickers_for_cusips
+
 #: Exact column -> pandas dtype contract for the 13F holdings data lake.
 EXPECTED_SCHEMA: Final[dict[str, str]] = {
     "cik": "string",
@@ -31,6 +34,7 @@ EXPECTED_SCHEMA: Final[dict[str, str]] = {
     "nameOfIssuer": "string",
     "titleOfClass": "string",
     "cusip": "string",
+    "ticker": "string",  # Derived from the CUSIP, not from the filing
     "value": "Int64",  # Pandas nullable integer
     "sshPrnamt": "Int64",  # Shares
     "sshPrnamtType": "string",
@@ -45,14 +49,14 @@ EXPECTED_SCHEMA: Final[dict[str, str]] = {
 #: edgartools normalizes the SEC XML element names before handing back a frame
 #: (``Issuer`` instead of ``nameOfIssuer``, ``SharesPrnAmount`` instead of
 #: ``sshPrnamt``, ...). Everything listed here is renamed into
-#: :data:`EXPECTED_SCHEMA` before conformance; unmapped source columns such as
-#: the derived ``Ticker`` are dropped. Without this step a reindex onto
-#: :data:`EXPECTED_SCHEMA` would silently produce an all-null frame, because not
-#: a single source column name matches.
+#: :data:`EXPECTED_SCHEMA` before conformance; unmapped source columns are dropped.
+#: Without this step a reindex onto :data:`EXPECTED_SCHEMA` would silently produce
+#: an all-null frame, because not a single source column name matches.
 SOURCE_COLUMN_MAP: Final[dict[str, str]] = {
     "Issuer": "nameOfIssuer",
     "Class": "titleOfClass",
     "Cusip": "cusip",
+    "Ticker": "ticker",
     "Value": "value",
     "SharesPrnAmount": "sshPrnamt",
     "Type": "sshPrnamtType",
@@ -131,6 +135,8 @@ def enforce_schema(holdings: pd.DataFrame) -> pd.DataFrame:
     Source columns are first renamed through :data:`SOURCE_COLUMN_MAP`. The frame
     is returned with a fresh ``RangeIndex`` and columns in schema order, so
     callers never have to reason about the incidental shape of the source filing.
+    ``ticker`` is resolved from the CUSIP rather than taken from the source, so a
+    filing whose information table edgartools does not enrich still gets one.
     """
     frame = holdings.rename(columns=SOURCE_COLUMN_MAP)
     frame = frame.loc[:, ~frame.columns.duplicated()]
@@ -144,6 +150,7 @@ def enforce_schema(holdings: pd.DataFrame) -> pd.DataFrame:
             frame[column] = _as_nullable_string(frame[column])
         else:
             frame[column] = caster(frame[column])  # type: ignore[operator]
+    frame["ticker"] = tickers_for_cusips(frame["cusip"])
     return frame
 
 
