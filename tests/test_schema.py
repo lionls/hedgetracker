@@ -19,15 +19,40 @@ def test_source_columns_are_mapped_to_the_lake_schema(infotable):
     assert holdings.loc[0, "Sole"] == 0
     assert holdings.loc[0, "Shared"] == 0
     assert holdings.loc[0, "None"] == 83760
-    # A derived column edgartools adds is not part of the lake contract.
-    assert "Ticker" not in holdings.columns
+    assert holdings.loc[0, "ticker"] == "AMZN"
+
+
+def test_ticker_comes_from_the_cusip_not_from_the_filing(infotable):
+    # Pre-2013 information tables are embedded rather than XML, and edgartools only
+    # annotates the XML form, so the bundled reference map is what decides.
+    without_column = enforce_schema(infotable().drop(columns=["Ticker"]))
+    with_a_wrong_one = enforce_schema(infotable(Ticker="ZZZZ"))
+
+    assert without_column.loc[0, "ticker"] == "AMZN"
+    assert with_a_wrong_one.loc[0, "ticker"] == "AMZN"
+
+
+def test_a_cusip_the_reference_map_does_not_know_leaves_the_ticker_null(infotable):
+    holdings = enforce_schema(infotable(Cusip="999999999"))
+
+    assert list(holdings.columns) == list(EXPECTED_SCHEMA)
+    assert holdings["ticker"].isna().all()
+
+
+def test_ticker_lookup_survives_the_letter_case_a_filer_used(infotable):
+    # Filers do write the letters in lower case, the bundled map does not.
+    holdings = enforce_schema(infotable(Cusip="29355a107"))
+
+    assert holdings.loc[0, "ticker"] == "ENPH"
+    # Only the lookup is case-insensitive: the stored CUSIP stays as filed.
+    assert holdings.loc[0, "cusip"] == "29355a107"
 
 
 def test_columns_missing_from_the_source_are_created_as_nulls(infotable):
     holdings = enforce_schema(infotable().drop(columns=["PutCall", "OtherManager", "Cusip"]))
 
     assert list(holdings.columns) == list(EXPECTED_SCHEMA)
-    for column in ("putCall", "otherManager", "cusip"):
+    for column in ("putCall", "otherManager", "cusip", "ticker"):
         assert column in holdings.columns
         assert holdings[column].isna().all()
 
