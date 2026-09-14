@@ -459,6 +459,14 @@ schema comparison reads Parquet metadata only. `--force` (1.0 s for the same 25
 files) re-derived the column on the ticker-era lake too, which is how the two
 lower-case CUSIPs above were picked up after the fact.
 
+Conforming is an exact substitute for recrawling the same window, and cannot be
+distinguished from it afterwards: dropping `ticker` from the 25 files of a fresh
+Q3 2024 smoke crawl — a simulated lake extracted before the column — and
+conforming it reproduced all 3069 rows with no differing row, file by file. What
+`conform` cannot do is re-read a filing: it re-projects rows already in the lake
+through the function the extraction writes through, so a change to the *parsing*
+is the one thing that needs a recrawl.
+
 The sweep was verified end to end on a second Prefect server — the same image with
 `PREFECT_API_URL` pointed at it: the 2024 backfill ran its four windows as
 subflows of one parent run on that instance, and a second sweep of the same range
