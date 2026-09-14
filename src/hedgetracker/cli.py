@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from hedgetracker import data, settings
+from hedgetracker import data, settings, storage
 from hedgetracker.flows.sec_13f import backfill_13f, extract_quarterly_13f
 
 
@@ -22,14 +22,19 @@ def _quarters(text: str) -> tuple[int, ...]:
     return quarters
 
 
-def _add_extraction_options(parser: argparse.ArgumentParser) -> None:
-    """Add the destination and identity options that every extraction command shares."""
+def _add_base_dir_option(parser: argparse.ArgumentParser) -> None:
+    """Add the data lake root option, resolved by :func:`settings.base_dir`."""
     parser.add_argument(
         "--base-dir",
         default=None,
         help="data lake root (default: "
         f"${settings.BASE_DIR_ENV_VAR} or {settings.DEFAULT_BASE_DIR})",
     )
+
+
+def _add_extraction_options(parser: argparse.ArgumentParser) -> None:
+    """Add the destination and identity options that every extraction command shares."""
+    _add_base_dir_option(parser)
     parser.add_argument(
         "--email",
         default=None,
@@ -81,6 +86,22 @@ def _parser() -> argparse.ArgumentParser:
         help=f"quarters to sweep in every year (default: {','.join(map(str, data.QUARTERS))})",
     )
     _add_extraction_options(backfill)
+
+    conform = subcommands.add_parser(
+        "conform",
+        help="rewrite lake holdings files that are not on the current schema",
+        description="Read the lake, and rewrite every holdings file whose Parquet "
+        "schema differs from the one this version writes — for example a file "
+        "extracted before the CUSIP-derived ticker column existed. Nothing is "
+        "requested from EDGAR, and files that already conform are left untouched.",
+    )
+    _add_base_dir_option(conform)
+    conform.add_argument(
+        "--force",
+        action="store_true",
+        help="rewrite every file, not just the ones whose schema is out of date "
+        "(needed when a derived column's values change)",
+    )
     return parser
 
 
@@ -104,6 +125,8 @@ def main(argv: list[str] | None = None) -> int:
             base_dir=settings.base_dir(args.base_dir),
             limit=args.limit,
         )
+    elif args.command == "conform":
+        summary = storage.conform_holdings(settings.base_dir(args.base_dir), force=args.force)
     else:
         raise AssertionError(f"unhandled command {args.command!r}")
     json.dump(summary, sys.stdout, indent=2)

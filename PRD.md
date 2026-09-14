@@ -39,6 +39,14 @@ EXPECTED_SCHEMA = {
 
 ```
 
+> **Amended after the original contract.** The lake also carries
+> `"ticker": "string"` between `cusip` and `value`: the ticker is resolved from
+> each holding's CUSIP through the reference map bundled with `edgartools`, not
+> read from the filing, so it is available for every era. Files written before
+> that column existed are brought onto the current schema by
+> `hedgetracker conform` (README, "Bringing an older lake onto the current
+> schema").
+
 ## 5. Flow and Task Specifications
 
 ### Task 1: `extract_13f_holdings(filing)`
@@ -54,6 +62,7 @@ EXPECTED_SCHEMA = {
 5. **Schema Conformance (CRITICAL):**
 * Reindex the DataFrame using `EXPECTED_SCHEMA.keys()`.
 * Force `cusip` to string and use `.str.zfill(9)` to restore any leading zeros stripped by pandas.
+* Resolve `ticker` from the normalized CUSIP via `hedgetracker.reference.tickers_for_cusips`, overwriting whatever the source carried.
 * Explicitly cast all columns to match `EXPECTED_SCHEMA`. Convert string representations of "nan" or "None" to actual null types.
 
 

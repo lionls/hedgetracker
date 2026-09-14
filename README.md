@@ -24,6 +24,12 @@ extract_13f_holdings (task, .map over every filing)
 * **Strict schema** — every file conforms to `EXPECTED_SCHEMA` (PyArrow), missing
   source columns are created as nulls, and `"nan"`/`"None"` placeholders become
   real nulls. A partition always reads back as one coherent table.
+* **Ticker per holding** — `ticker` is resolved from each holding's CUSIP through
+  the reference map bundled with `edgartools` (68,830 CUSIPs). That lookup is
+  offline, so it costs no SEC request and covers every era — edgartools itself
+  annotates only the XML information tables of 2013 and later — and `ticker` is
+  the key the daily bars join on. A CUSIP the map does not know stays null rather
+  than being guessed at.
 * **Fund-flow ready** — `report_period` is always present, so quarter-over-quarter
   position deltas can be computed per filer.
 
@@ -32,9 +38,10 @@ extract_13f_holdings (task, .map over every filing)
 ```
 src/hedgetracker/
 ├── schema.py            # EXPECTED_SCHEMA, enforce_schema(), ARROW_SCHEMA
+├── reference.py         # bundled CUSIP → ticker lookup
 ├── storage.py           # Hive-style partition paths + atomic Parquet writes
 ├── settings.py          # env-backed configuration
-├── cli.py               # `hedgetracker run ...`
+├── cli.py               # `hedgetracker run|backfill|conform ...`
 ├── data.py              # edgartools access helpers (identity, filing lookup)
 └── flows/
     └── sec_13f.py       # extract_13f_holdings task + extract_quarterly_13f flow
@@ -117,13 +124,48 @@ Every window is attempted even if an earlier one failed, and the run then raises
 with the list of failures, so a partial backfill never looks complete. Writes are
 idempotent and filings already in the lake are skipped, so re-running a range — or
 just the quarter that failed — costs only what it has not extracted yet. To force
-a rewrite after changing the extraction itself, delete the partition and run again.
+a rewrite after changing the extraction itself, delete the partition and run again;
+a schema-only change needs no re-extraction at all, just `conform` (below).
 
 A sweep from 2013 is ~54 windows of up to a few thousand filings each, hours of
 wall-clock time and a lot of SEC traffic: it is a background job, not a smoke
 test. `--start-year`, `--quarters` and `--limit` keep trial runs small. The same
 sweep is available as a Prefect deployment (`13f-backfill`, see
 [Docker Compose](#docker-compose)).
+
+### Bringing an older lake onto the current schema
+
+`ticker` was added to the schema after the first lakes had been extracted, and a
+holding's ticker is a pure function of its CUSIP, so a lake extracted under an
+older schema can be brought up to date without asking EDGAR for anything:
+
+```bash
+uv run hedgetracker conform                     # the default lake
+uv run hedgetracker conform --base-dir data/smoke
+```
+
+| Flag | Required | Meaning |
+| --- | --- | --- |
+| `--base-dir` | no | Data lake root, as for `run` |
+| `--force` | no | Rewrite every file, not only the ones whose schema is out of date |
+
+`conform` reads each file's Parquet metadata and rewrites only the files whose
+schema differs from the one this version writes, so an up-to-date lake costs one
+small read per file and nothing is written. Every file it does read is re-projected
+through `enforce_schema` — the same function the extraction writes through — and
+replaced atomically in place, so the result is the file the current code would
+have produced. Rows, and every column they already had, are untouched.
+
+The metadata comparison sees schema changes, not *value* changes: if a derived
+column's values were computed by older code — a ticker the reference map has since
+learned, a lookup that no longer misses on a lower-case CUSIP — the file is already
+on the current schema and is skipped. `--force` rewrites the lot, which is what
+re-derives those columns across an existing lake.
+
+This is the answer to "the schema changed, now what". A re-crawl is not: filings
+already in the lake are skipped rather than rewritten, so a full backfill would
+leave the old files exactly as they are. A `base_dir` with no holdings files at
+all is an error rather than a no-op, because it usually means a typo.
 
 ### Partitioning
 
@@ -387,19 +429,35 @@ run.
 
 ### Verification runs
 
-The offline suite passes (42 tests) and the live smoke run
-(`--year 2024 --quarter 3 --limit 25`, scratch lake) wrote 25 files / 3069 holding
-rows with no failures, spread over 11 report-period partitions
-(`2021Q4`-`2024Q2` — a Q3 2024 index window, so the partition is the filer's own
+The offline suite passes (49 tests). The live smoke run
+(`--year 2024 --quarter 4 --limit 25`, scratch lake) wrote 25 files / 1975 holding
+rows with no failures, in 24 s, spread over 8 report-period year partitions
+(`2017`-`2024` — a Q4 2024 index window, so the partition is the filer's own
 as-of date, not the filing date). Every file's Parquet schema equals
 `ARROW_SCHEMA` exactly, every `cik` column matches its file name, every partition
 matches its `report_period`, and string placeholders (`""`, `"nan"`, `"None"`)
 read back as real nulls.
 
+1953 of the 1975 rows (416 distinct CUSIPs) came out with a `ticker`. The
+reference map has no entry for 6 of those CUSIPs — 22 rows, among them Siemens A G
+New Ord and a Schwab money-market fund — and those stay null rather than being
+guessed at. Two resolved only because the lookup upper-cases the key: the filers
+had written `g0403h108` (Aon) and `29355a107` (Enphase) in lower case, which the
+map itself does not.
+
 Running the same command again wrote nothing: all 25 filings were recognised from
 their index pages (`written: 0`, `skipped_existing: 25`, `holdings_rows: 0`) in
-28 s, against 149 s for the cold run that also populated the EDGAR cache, and
-every file kept its sha256 and mtime.
+34 s wall clock, and every file kept its sha256.
+
+`conform` was verified against a lake extracted under the previous schema — a copy
+of the 25-file, 3069-row smoke lake (11 report-period partitions, 1101 distinct
+CUSIPs). It rewrote all 25 files in 1.0 s, and every pre-existing column came back
+with an identical content digest, file by file, so nothing but the schema changed.
+All 3069 rows got a ticker: the map knows every one of those 1101 CUSIPs. Running
+it again rewrote nothing (`rewritten: 0`, `skipped: 25`) in 0.0 s, because the
+schema comparison reads Parquet metadata only. `--force` (1.0 s for the same 25
+files) re-derived the column on the ticker-era lake too, which is how the two
+lower-case CUSIPs above were picked up after the fact.
 
 The sweep was verified end to end on a second Prefect server — the same image with
 `PREFECT_API_URL` pointed at it: the 2024 backfill ran its four windows as
