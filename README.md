@@ -28,8 +28,8 @@ extract_13f_holdings (task, .map over every filing)
   the reference map bundled with `edgartools` (68,830 CUSIPs). That lookup is
   offline, so it costs no SEC request and covers every era — edgartools itself
   annotates only the XML information tables of 2013 and later — and `ticker` is
-  the key the daily bars join on. A CUSIP the map does not know stays null rather
-  than being guessed at.
+  the key the daily bars join on (see [Market data](#market-data)). A CUSIP the map
+  does not know stays null rather than being guessed at.
 * **Fund-flow ready** — `report_period` is always present, so quarter-over-quarter
   position deltas can be computed per filer.
 
@@ -227,6 +227,125 @@ successful filings are written, and the flow then raises
 incomplete quarter therefore never looks like a completed one. Re-running the
 window is the fix, and it is a cheap one: filings already in the lake are skipped,
 so the re-run reads and writes only the gaps.
+
+## Market data
+
+A holding's `ticker` is the key the daily bars join on, so pricing a position — or
+measuring what a filer did between two quarters — is a join between the lake and a
+source of daily bars. Two sources are in play, and the second supplements the
+first rather than replacing it.
+
+### Daily bars folded from minute data
+
+`quotes` folds [`mito0o852/OHLCV-1m`](https://huggingface.co/datasets/mito0o852/OHLCV-1m)
+— 82 GB of one-minute US bars in 411 monthly Parquet files, 1992-01 through
+2026-03 — into one daily bar per ticker and session. The 82 GB is read over HTTPS
+and never copied; only the fold is written:
+
+| | |
+| --- | --- |
+| Destination | `{base_dir}/market/quotes_daily.parquet` |
+| Bars | 77,811,153 |
+| Tickers | 80,843 |
+| Sessions | 1992-01-02 through 2026-03-31 |
+| Columns | `ticker`, `date`, `open`, `high`, `low`, `close`, `volume` |
+
+That command lives on the `feat/quotes-daily` branch and is not in `main` yet. It
+stays as it is — the deeper history, folded from minute bars.
+
+### The supplementary source
+
+[`defeatbeta/yahoo-finance-data`](https://huggingface.co/datasets/defeatbeta/yahoo-finance-data)
+publishes 15 Parquet tables under `data/`, built from Yahoo Finance, Nasdaq and US
+Treasury data for research and educational use, licensed ODC-BY, and refreshed
+daily: `spec.json` carries the `update_time`, which read `2026-09-14T05:09:09Z`
+when the numbers below were taken. Its daily bars are a finished table, so there
+is nothing to fold and — for now — nothing to cache: each table is read over
+HTTPS, straight off the Hub.
+
+```sql
+SELECT symbol, report_date, close, volume
+FROM 'https://huggingface.co/datasets/defeatbeta/yahoo-finance-data/resolve/main/data/stock_prices.parquet'
+WHERE symbol = 'KO'
+ORDER BY report_date DESC
+LIMIT 5;
+```
+
+Every table follows the same shape, `resolve/main/data/<table>.parquet`. DuckDB
+reads the Parquet footer first and then only the column chunks a query names, so a
+filtered query touches a fraction of a 445 MiB file. Two things to remember when
+running it from a sandbox like this one: DuckDB reads `HTTP_PROXY`/`HTTPS_PROXY`
+itself but cannot parse a proxy URL that carries credentials, and a value it
+cannot parse fails the query, so drop those variables and set the proxy through
+`SET http_proxy` / `http_proxy_username` / `http_proxy_password` instead, exactly
+as `quotes.py` does; and keep `temp_directory` out of the repo, because a spill
+there is written inside `data/` and has filled the disk before.
+
+#### Tables worth joining
+
+| Table | Size | Rows | Contents |
+| --- | --- | --- | --- |
+| `stock_prices` | 445 MiB | 36,678,606 | `symbol`, `report_date`, `open`, `close`, `high`, `low`, `volume` — `DECIMAL(16,4)` prices, `BIGINT` volume |
+| `stock_split_events` | 67 KiB | 9,943 | `split_factor` as a ratio string (`4:1`) |
+| `stock_dividend_events` | 702 KiB | 305,630 | cash amount per share, by ex-date |
+| `stock_shares_outstanding` | 5.7 MiB | 1,169,882 | shares outstanding, by `report_date` |
+| `stock_profile` | 2.5 MiB | 11,351 | sector, industry, employees, address |
+| `exchange_rate` | 3.1 MiB | 243,207 | `EUR=X`-style pairs with OHLC |
+| `stock_sec_filing` | 87 MiB | 7,830,197 | `cik`, `accession_number`, `form_type`, `filing_date`, `filing_url`, 13F-HR included |
+
+The rest are financials and text — `stock_statement` (112 MiB), `stock_news`
+(1.1 GiB), `stock_earning_call_transcripts` (2.1 GiB), `stock_tailing_eps`,
+`stock_officers`, `stock_revenue_breakdown`, `stock_earning_calendar`,
+`daily_treasury_yield` — and none of them is needed to price a holding.
+
+#### What `stock_prices` holds
+
+Verified against the live table on 2026-09-14: 36,678,606 bars for 12,289 symbols,
+1994-11-30 through 2026-09-11, with no duplicate `symbol`/`report_date` pair — the
+join key is unique — and every `report_date` an ISO `YYYY-MM-DD` string, so cast
+it before joining. A symbol's history starts where the symbol starts (`ENPH` from
+2012-03-30, its listing) and any symbol already trading before 1994-11-30 (`AON`,
+`GILD`, `KO`) begins on that first date instead. Prices are **split-adjusted**:
+AAPL closes at 126.52 on 2020-08-26, the session before its 4:1 split, rather than
+the ~$500 an unadjusted series would show. Corporate actions are their own rows,
+so a total-return figure needs `stock_split_events` and `stock_dividend_events`
+alongside the bars.
+
+#### What it does not cover
+
+`stock_prices.symbol` is Yahoo's ticker, while the lake's `ticker` comes from the
+CUSIP map bundled with `edgartools`, and the two spell share classes differently:
+edgartools writes `BRKB` where Yahoo writes `BRK-B`. Compare separator-stripped
+(`replace(upper(symbol), '-', '')`) rather than verbatim. Measured over the 3,069
+holding rows and $5.54B of reported value in `data/smoke/13f_holdings`, with each
+CUSIP resolved the way `conform` resolves it:
+
+| Join | Rows priced | Reported value priced |
+| --- | --- | --- |
+| verbatim | 1,974 (64.3%) | $2.75B (49.7%) |
+| separator-stripped | 1,988 (64.8%) | $2.79B (50.4%) |
+
+Normalization is worth 14 rows and $38.8M of that, all of it Berkshire's class B.
+What stays unpriced is mostly funds: the lake's largest unmatched positions are
+`VNQ`, `VTEB`, `SHV`, `SCHO`, `DFAC`, `BIL`, `IEF`, `AVUS`, `XLP` and `SCHB`, and
+the only ETFs the table carries are the largest in the market (`SPY`, `QQQ`,
+`IVV`). Across the map as a whole, 10,268 of its 55,145 distinct tickers — 18.6% —
+have bars: the map reaches every SEC-registered security, including funds, foreign
+ordinaries, units and rights, while this table covers listed equities.
+
+The gap that matters most for 13F work is **delisted symbols**: `TWTR` and `ATVI`
+return no rows, so a position that has since been acquired, merged away or
+delisted cannot be priced here — a 2021 filing's Twitter stake has no bars to join
+to, whatever it was worth at the time. Anything survivorship-sensitive needs a
+second source for those names.
+
+#### Next
+
+The first use is enrichment: join each holding to the bar for its filing date to
+get a price and a position value, carry that quarter over quarter, and take a
+sector from `stock_profile` for grouping. Caching the Parquet files locally is
+deferred until that work needs it — `stock_prices` is 445 MiB and reads fine over
+HTTPS.
 
 ## Docker Compose
 
