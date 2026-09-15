@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1
+
+# Deployment image for the market explorer: the Go API and the built React
+# frontend, which is all the app needs to serve itself. Nothing about the
+# dataset is baked in — every request reads the Parquet files on Hugging Face —
+# so the image is the same bytes wherever it runs.
+#
+#   docker compose up -d --build explorer      # reads docker-compose.yml
+#   docker run -p 8080:8080 hedgetracker-explorer:dev
+#
+# See the "Running it on a server" section of README.md.
+
+# ---- frontend --------------------------------------------------------------
+FROM node:22-bookworm-slim AS web
+WORKDIR /web
+# package.json first: the dependency layer only rebuilds when the lock changes.
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
+# ---- backend ---------------------------------------------------------------
+# go-duckdb links DuckDB's C++ static library, so this stage needs cgo and a
+# glibc toolchain: the Debian images, not Alpine.
+FROM golang:1.26-bookworm AS server
+WORKDIR /src
+ENV CGO_ENABLED=1
+COPY server/go.mod server/go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY server/ ./
+# -trimpath and -s -w: a reproducible path-free binary, ~40% smaller.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build -trimpath -ldflags "-s -w" -o /out/marketdata .
+
+# ---- runtime ---------------------------------------------------------------
+FROM debian:bookworm-slim
+# ca-certificates for the HTTPS reads, libstdc++6 for DuckDB's C++ runtime,
+# which the Go binary links against but does not bundle (`ldd marketdata`).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --uid 10001 --shell /usr/sbin/nologin --no-create-home app \
+ && mkdir -p /app/web /tmp/marketdata \
+ && chown app:app /tmp/marketdata
+WORKDIR /app
+COPY --from=server /out/marketdata /app/marketdata
+COPY --from=web /web/dist /app/web
+
+# Runs unprivileged; the one path it writes to is the spill directory, and HOME
+# points there too because DuckDB autoinstalls the httpfs extension into
+# $HOME/.duckdb on first use.
+USER app
+ENV HOME=/tmp/marketdata
+# DuckDB spills here on a large sort, and nothing else is written to disk.
+VOLUME ["/tmp/marketdata"]
+EXPOSE 8080
+# The binary is the healthcheck: the image installs no curl or wget.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["/app/marketdata", "-health", "-addr", ":8080"]
+# ENTRYPOINT is the binary, CMD the flags, so `docker run <image> -addr :9000`
+# and compose's `command:` both replace just the flags.
+ENTRYPOINT ["/app/marketdata"]
+CMD ["-addr", ":8080", "-web", "/app/web", "-temp-dir", "/tmp/marketdata"]

@@ -28,8 +28,9 @@ extract_13f_holdings (task, .map over every filing)
   the reference map bundled with `edgartools` (68,830 CUSIPs). That lookup is
   offline, so it costs no SEC request and covers every era — edgartools itself
   annotates only the XML information tables of 2013 and later — and `ticker` is
-  the key the daily bars join on. A CUSIP the map does not know stays null rather
-  than being guessed at.
+  the key the daily bars join on (see [Market data](#market-data) and the
+  [market explorer](#market-explorer)). A CUSIP the map does not know stays null
+  rather than being guessed at.
 * **Fund-flow ready** — `report_period` is always present, so quarter-over-quarter
   position deltas can be computed per filer.
 
@@ -46,6 +47,12 @@ src/hedgetracker/
 └── flows/
     └── sec_13f.py       # extract_13f_holdings task + extract_quarterly_13f flow
 tests/                   # offline unit tests + `-m live` SEC integration tests
+server/                  # Go + DuckDB backend for the market explorer
+├── main.go              # flags, boot-time warm, graceful shutdown
+├── duck.go              # DuckDB DSN, proxy handling, httpfs
+├── dataset.go           # ticker index, profiles, bars, fundamentals, response caches
+└── api.go               # JSON endpoints + the built frontend
+web/                     # React frontend (Vite, lightweight-charts)
 ```
 
 ## Setup
@@ -227,6 +234,457 @@ successful filings are written, and the flow then raises
 incomplete quarter therefore never looks like a completed one. Re-running the
 window is the fix, and it is a cheap one: filings already in the lake are skipped,
 so the re-run reads and writes only the gaps.
+
+## Market data
+
+A holding's `ticker` is the key the daily bars join on, so pricing a position — or
+measuring what a filer did between two quarters — is a join between the lake and a
+source of daily bars. Two sources are in play, and the second supplements the
+first rather than replacing it.
+
+### Daily bars folded from minute data
+
+`quotes` folds [`mito0o852/OHLCV-1m`](https://huggingface.co/datasets/mito0o852/OHLCV-1m)
+— 82 GB of one-minute US bars in 411 monthly Parquet files, 1992-01 through
+2026-03 — into one daily bar per ticker and session. The 82 GB is read over HTTPS
+and never copied; only the fold is written:
+
+| | |
+| --- | --- |
+| Destination | `{base_dir}/market/quotes_daily.parquet` |
+| Bars | 77,811,153 |
+| Tickers | 80,843 |
+| Sessions | 1992-01-02 through 2026-03-31 |
+| Columns | `ticker`, `date`, `open`, `high`, `low`, `close`, `volume` |
+
+That command lives on the `feat/quotes-daily` branch and is not in `main` yet. It
+stays as it is — the deeper history, folded from minute bars.
+
+### The supplementary source
+
+[`defeatbeta/yahoo-finance-data`](https://huggingface.co/datasets/defeatbeta/yahoo-finance-data)
+publishes 15 Parquet tables under `data/US/`, built from Yahoo Finance, Nasdaq and
+US Treasury data for research and educational use, licensed ODC-BY, and refreshed
+daily: `spec.json` sits at the repo root, one level above `data/`, carrying the
+`update_time` — `2026-09-15T05:10:40Z` when the numbers below were taken — and a
+sha256 per file; the revision itself is `6d603343ced0d83114a529bed4872a12ae0b7c8b`.
+Its daily bars are a finished table, so there is nothing to fold and — for now —
+nothing to cache: each table is read over HTTPS, straight off the Hub. The tables
+moved under a country directory at some point, so an older `resolve/main/data/…`
+path that used to work — as the first revision of this section had it — returns
+404 and the prefix is `data/US/` everywhere below.
+
+```sql
+SELECT symbol, report_date, close, volume
+FROM 'https://huggingface.co/datasets/defeatbeta/yahoo-finance-data/resolve/main/data/US/stock_prices.parquet'
+WHERE symbol = 'KO'
+ORDER BY report_date DESC
+LIMIT 5;
+```
+
+Every table follows the same shape, `resolve/main/data/US/<table>.parquet`, with
+the SEC's `company_tickers.json` (1.4 MB, 10,432 tickers) sitting beside them in
+`data/US/` even though it is not one of the 15. DuckDB reads the Parquet footer
+first and then only the column chunks a query names, so a
+filtered query touches a fraction of a 445 MiB file. Two things to remember when
+running it from a sandbox like this one: DuckDB reads `HTTP_PROXY`/`HTTPS_PROXY`
+itself but cannot parse a proxy URL that carries credentials, and a value it
+cannot parse fails the query, so drop those variables and set the proxy through
+`SET http_proxy` / `http_proxy_username` / `http_proxy_password` instead, exactly
+as `quotes.py` does; and keep `temp_directory` out of the repo, because a spill
+there is written inside `data/` and has filled the disk before.
+
+#### Tables worth joining
+
+| Table | Size | Rows | Contents |
+| --- | --- | --- | --- |
+| `stock_prices` | 445 MiB | 36,701,230 | `symbol`, `report_date`, `open`, `close`, `high`, `low`, `volume` — `DECIMAL(16,4)` prices, `BIGINT` volume |
+| `stock_split_events` | 67 KiB | 9,947 | `split_factor` as a ratio string (`4:1`) |
+| `stock_dividend_events` | 700 KiB | 305,713 | cash amount per share, by ex-date |
+| `stock_shares_outstanding` | 5.7 MiB | 1,169,934 | shares outstanding, by `report_date` |
+| `stock_profile` | 2.5 MiB | 11,358 | sector, industry, employees, address |
+| `exchange_rate` | 3.1 MiB | 243,276 | `EUR=X`-style pairs with OHLC |
+| `stock_sec_filing` | 87 MiB | 7,832,949 | `cik`, `accession_number`, `form_type`, `filing_date`, `filing_url`, 13F-HR included |
+
+Sizes and row counts read from the live files on 2026-09-15, at revision
+`6d603343`; the day's refresh added 22,624 bars, 9 symbols and 8 profiles to a
+table that had 36,678,606 bars for 12,289 symbols the day before.
+
+The rest are financials and text — `stock_statement` (112 MiB), `stock_news`
+(1.1 GiB), `stock_earning_call_transcripts` (2.1 GiB), `stock_tailing_eps`,
+`stock_officers`, `stock_revenue_breakdown`, `stock_earning_calendar`,
+`daily_treasury_yield` — and none of them is needed to price a holding.
+
+#### What `stock_prices` holds
+
+Verified against the live table on 2026-09-15: 36,701,230 bars for 12,298 symbols,
+1994-11-30 through 2026-09-14, with no duplicate `symbol`/`report_date` pair — the
+join key is unique — and every `report_date` an ISO `YYYY-MM-DD` string, so cast
+it before joining. A symbol's history starts where the symbol starts (`ENPH` from
+2012-03-30, its listing) and any symbol already trading before 1994-11-30 (`AON`,
+`GILD`, `KO`) begins on that first date instead. Prices are **split-adjusted**:
+AAPL closes at 126.52 on 2020-08-26, the session before its 4:1 split, rather than
+the ~$500 an unadjusted series would show. Corporate actions are their own rows,
+so a total-return figure needs `stock_split_events` and `stock_dividend_events`
+alongside the bars.
+
+#### What it does not cover
+
+`stock_prices.symbol` is Yahoo's ticker, while the lake's `ticker` comes from the
+CUSIP map bundled with `edgartools`, and the two spell share classes differently:
+edgartools writes `BRKB` where Yahoo writes `BRK-B`. Compare separator-stripped
+(`replace(upper(symbol), '-', '')`) rather than verbatim. Measured over the 3,069
+holding rows and $5.54B of reported value in `data/smoke/13f_holdings` —
+re-measured on 2026-09-15: 25 Parquet files, 1,098 distinct resolved tickers, none
+the map cannot resolve — with each CUSIP resolved the way `conform` resolves it:
+
+| Join | Rows priced | Reported value priced |
+| --- | --- | --- |
+| verbatim | 1,974 (64.3%) | $2.75B (49.7%) |
+| separator-stripped | 1,988 (64.8%) | $2.79B (50.4%) |
+
+Normalization is worth 14 rows and $38.8M of that, all of it Berkshire's class B.
+What stays unpriced is mostly funds: the lake's largest unmatched positions are
+`VNQ`, `VTEB`, `SHV`, `SCHO`, `DFAC`, `BIL`, `IEF`, `AVUS`, `XLP` and `SCHB`, and
+the only ETFs the table carries are the largest in the market (`SPY`, `QQQ`,
+`IVV`). Across the map as a whole, 10,303 of its 55,145 distinct tickers — 18.7% —
+have bars: the map reaches every SEC-registered security, including funds, foreign
+ordinaries, units and rights, while this table covers listed equities.
+
+The gap that matters most for 13F work is **delisted symbols**: `TWTR` and `ATVI`
+return no rows, so a position that has since been acquired, merged away or
+delisted cannot be priced here — a 2021 filing's Twitter stake has no bars to join
+to, whatever it was worth at the time. Anything survivorship-sensitive needs a
+second source for those names.
+
+#### Next
+
+The first use is enrichment: join each holding to the bar for its filing date to
+get a price and a position value, carry that quarter over quarter, and take a
+sector from `stock_profile` for grouping. Caching the Parquet files locally is
+deferred until that work needs it — `stock_prices` is 445 MiB and reads fine over
+HTTPS. The [market explorer](#market-explorer) below is the first consumer of
+these tables: it fetches a symbol's whole history in one query, which is the shape
+the join wants, and it makes the gap between a ticker the map knows and a ticker
+that has bars visible before any of that work starts.
+
+## Market explorer
+
+`server/` and `web/` are a browser for those tables: a ticker search, a company
+card, a candlestick chart with volume, and a second page that lists operating
+companies with their financial statements. The Go process answers every request
+straight from the Parquet files on the Hub — no local copy of a table, no database
+file, nothing written outside DuckDB's spill directory in `/tmp` — and the React
+app is two pages with no router and no state library, because the whole app is six
+endpoints and a handful of pieces of state. Both pages are one component with a
+`page` prop, chosen from `location.pathname`; navigation is two `<a href>`s that
+reload the bundle, which is cheaper than a router for two pages of a local app.
+
+| | |
+| --- | --- |
+| Backend | Go 1.26, `github.com/marcboeker/go-duckdb/v2` (cgo, statically linked DuckDB) |
+| Frontend | React 19, Vite 8, `lightweight-charts` 5 |
+| Source of truth | `data/US/` on the Hub, read through DuckDB's `httpfs` |
+| Binary | 70 MB; 17 s to build cold, 2.5 s warm |
+
+### Endpoints
+
+| Route | Answer |
+| --- | --- |
+| `GET /api/health` | `{"status":"ok","tables":"data/US/","symbols":11908,"priced":12298,"pricedDone":true}` |
+| `GET /api/search?q=appl&limit=25&stocks=1` | `{"query":"appl","results":[{"symbol":"AAPL","name":"Apple Inc.","sector":"Technology","priced":true}]}` — `limit` is capped at 200, and `stocks=1` skips every indexed symbol that is not an operating company, which is what the stocks page searches: `spy` loses `SPY` and `SPYU` but keeps `SGP` and `SYRE` |
+| `GET /api/stocks` | `{"stocks":[{"symbol":"AAPL","name":"Apple Inc.","sector":"Technology"},…]}` — all 8,643 operating companies, alphabetical, in one response |
+| `GET /api/fundamentals/KO` | `{"symbol":"KO","periods":["2025-12-31",…],"groups":[{"name":"Income statement","rows":[{"key":"total_revenue","label":"Revenue","unit":"usd","values":[47941000000,…]},…]},…],"shares":4303000000,"trailingEps":3.3191}`; `404 {"error":"no fundamentals for symbol"}` for a symbol the dataset filed no annual statements for (every fund), and `400` for a symbol that is not a ticker |
+| `GET /api/company/AAPL` | `{"symbol":"AAPL","name":"Apple Inc.","sector":"Technology","industry":"Consumer Electronics","employees":150000,"website":"https://www.apple.com","city":"Cupertino","country":"United States"}`; `404 {"error":"unknown symbol"}` |
+| `GET /api/bars/AAPL?range=1y\|5y\|max` | `{"symbol":"AAPL","range":"5y","dates":[…],"open":[…],"high":[…],"low":[…],"close":[…],"volume":[…]}`; `range` defaults to `5y` and any other value is a `400` |
+| `GET /*` | `web/dist`, falling back to `index.html` |
+
+The history travels as one array per field instead of one object per bar, which
+makes the JSON — and its gzip — roughly three times smaller, and every `/api/`
+response is gzipped. Price columns are `DECIMAL(16,4)` in the file and cast to
+`DOUBLE` in SQL, volume to `BIGINT`.
+
+### The stocks page
+
+`/stocks` is the same app in a second mode: same chart, same company card, same
+search, restricted to operating companies, with the selected symbol's financial
+statements between the chart and the company card. It exists because the index
+does not distinguish an equity from a SPAC unit, a preferred class or an ETF, and
+because none of the statement tables were reachable from the page at all.
+
+**What counts as a stock.** The dataset states no `quote_type`, so the filter is
+what the profile table allows: a symbol survives if `stock_profile` gives it a
+sector, its industry is not `Shell Companies`, and its symbol has no class suffix.
+Of the 11,358 profile rows, 9,805 carry a non-empty sector — the missing 1,553 are
+the funds, which report nothing but a name — and the sector alone removes every
+ETF in the table, `SPY` and `QQQ` included, along with every SPAC unit and warrant
+that has no other detail. 828 rows report `Shell Companies`, which is what a
+blank-check vehicle files, and that removes the units that do carry a sector. Of
+the 363 dash-suffixed symbols left, the tails `-P*` (preferred classes), `-WI`
+(when-issued), `-UN`/`-U` (units), `-WS`/`-WT` (warrants) and `-RT`/`-CL` (rights)
+are dropped; a plain class like `BRK-B` or `AGM-A` has no such tail and stays.
+11,908 indexed symbols go in, 8,643 come out, across 11 sectors.
+
+The rule is a heuristic over a table that was never meant to answer this question,
+and it errs in one direction: a security that files statements and reports a
+sector is kept, so a closed-end fund (`QQQX`, `NBB`) stays in the list where an
+ETF does not. Telling those apart needs a field the dataset does not carry.
+
+**Browsing.** The page fetches `/api/stocks` once — the entire list, 634 KB,
+114 KB gzipped, 4 ms out of the in-process index — and then filters in the
+browser: a sector `<select>` over those 11 sectors, and a *Show 100 more* button,
+because rendering ten thousand rows costs more than drawing the chart does.
+Typing hands the sidebar back to `/api/search` with `stocks=1`, so the page never
+lists a symbol its own browse list would not.
+
+**The panel.** `GET /api/fundamentals/<symbol>` answers with the annual rows of
+`stock_statement` — revenue, gross profit, operating income, net income, diluted
+EPS, total assets, total liabilities, shareholders' equity, total debt, cash and
+equivalents, operating cash flow, free cash flow, capital expenditure — for the
+five most recent fiscal years, grouped into income statement, balance sheet and
+cash flow. The browser adds the two figures the statements imply but do not state
+(net margin, revenue growth) and the two that need a price (market cap and P/E,
+from the share count, trailing EPS and latest close that ride along in the same
+response, so nothing in the panel waits on the chart's own bars). Annual periods
+only: the dataset also files a trailing-twelve-month row per symbol, under the
+literal
+`report_date = 'TTM'`, and mixing it into the fiscal years would label a
+twelve-month window as a year. A symbol with no statements — every fund — says so
+instead of showing an empty table.
+
+The panel sits between the chart and the company card rather than at the bottom of
+the column, which is a layout decision with a number behind it: at the end of the
+column it began 651 px down on a 1440×768 window — chart at its 380 px minimum,
+then the company card — which is past the fold entirely on a 600 px-tall window,
+and a column that scrolls without a scrollbar gives no hint that anything is
+there. Above the card it starts at 479 px, so the heading, the figures and the
+first table are on screen without scrolling at every window height tested from 600
+to 1100 px.
+
+The same sweep found the second layout, which had the same fault: below 900 px
+wide the grid collapses to one column and the sidebar is stacked over the chart,
+which put the figures at 795 px — 27 px past the fold of a 768 px window. The
+sidebar is capped at 32vh there and the chart states a 280 px height in place of
+its 380 px minimum; a minimum cannot shrink it, because the canvas is laid out at
+its initial height and holds the panel open. In that layout the figures sit at
+664 px in the same window, and the panel is the first thing under the chart in
+both layouts rather than the last thing in the column.
+
+The read is per symbol and cached in the process like the bars are, so a second
+visitor to a symbol pays 0.5 ms. The first one pays for the statements and one
+query that unions three one-row reads — the latest share count, the latest
+trailing EPS and the latest close — which together cost about as much as the
+chart's own first read; that is why the panel and the chart appear together. A
+figures read that fails is served with dashes but not cached, so a retry fills it
+in rather than pinning the dashes on the symbol for the life of the process.
+
+### Running it
+
+```sh
+cd web    && npm install && npm run build   # writes web/dist, 0.8 s
+cd server && go build -o marketdata .       # 70 MB, 17 s cold
+cd server && ./marketdata                   # :8080, serving web/dist
+```
+
+For frontend work `npm run dev` in `web/` serves the page on `:5173` with `/api`
+proxied to `:8080`, leaving the Go process running as it is. `-addr` and `-web`
+move the defaults, and `-temp-dir` (default `/tmp/hedgetracker-marketdata`) is
+where DuckDB spills — it must stay outside the repo.
+
+### Running it on a server
+
+`Dockerfile.explorer` builds the whole app in one image — the Vite bundle in a
+`node:22-bookworm-slim` stage, the cgo binary in `golang:1.26-bookworm`, both
+copied into a `debian:bookworm-slim` runtime — and `docker-compose.yml` carries it
+as an `explorer` service behind a profile, so a bare `docker compose up -d` still
+means the Prefect harness and nothing else:
+
+```sh
+docker compose up -d --build explorer    # build, start, publish :8080
+docker compose logs -f explorer          # index warm, listening, then the priced scan
+docker compose --profile explorer down   # stops and removes the container, keeps the image
+```
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `EXPLORER_PORT` | `8080` | Published host port; the container always listens on `8080` |
+| `EXPLORER_MEMORY` | `2GB` | DuckDB's memory limit; the boot scan is the one query that wants more |
+| `EXPLORER_THREADS` | `4` | DuckDB threads |
+| `EXPLORER_HTTPS_PROXY` | empty | Sets `HTTPS_PROXY` in the container, for a host that reaches the Hub only through a proxy |
+| `EXPLORER_NO_PROXY` | empty | Hosts to skip for that proxy |
+
+Debian, not Alpine, because `go-duckdb` links DuckDB's C++ static library against
+glibc. Besides that library and `ca-certificates` — the two things `ldd
+marketdata` asks for beyond libc — the image installs nothing. It runs as uid
+`10001`, and the only path it can write to is `/tmp/marketdata` (the
+`marketdata-temp` volume), where DuckDB spills and where it also unpacks the
+`httpfs` extension on first use. Nothing of the dataset is ever on disk, so the
+image is the same 144 MB wherever it runs and a redeploy changes nothing about
+the data.
+
+Two consequences of reading Parquet over HTTPS. The container needs egress to
+`huggingface.co` for every query, which is why `restart: unless-stopped` is there
+to bring it back after a transient failure — and why the healthcheck is the
+binary itself (`-health`, since the image has no `curl`): it stays red until the
+dataset index actually loads. Everything else belongs to the reverse proxy.
+`api.go` gzips `/api/` responses but serves the frontend as-is, so terminate TLS
+and compress the bundle in front of the container if that matters. Only
+`linux/amd64` was built and run here; the Dockerfile is architecture-neutral, and
+`go-duckdb` ships the static DuckDB library for `linux/arm64` too.
+
+### Measured
+
+Against the running server on 2026-09-15, over the proxy this sandbox uses:
+
+| Step | Measured |
+| --- | --- |
+| Boot: index warm — 10,432 SEC names + 11,358 profiles → 11,908 symbols | 5.1 s cold, 3.4 s with DuckDB's HTTP metadata cache already warm |
+| Boot: `SELECT DISTINCT symbol`, on a background goroutine | 38.9 s, 12,298 symbols |
+| `GET /api/search?q=appl` | 4 ms |
+| `GET /api/bars/AAPL?range=5y`, first read of the file | 2.65 s |
+| `GET /api/bars/AAPL?range=max`, same symbol, 7,999 bars | 38–48 ms |
+| `GET /api/bars/AAPL?range=5y` again, from the in-process cache | 0.98 ms |
+| `GET /api/bars/KO?range=5y`, first read of the file | 3.22 s |
+| `GET /api/bars/MSFT?range=5y`, gzipped | 21,556 B (56,830 B raw) |
+| `GET /api/bars/AAPL?range=max`, gzipped | 126,521 B (407,912 B raw) |
+| `GET /api/stocks`, the whole browse list | 634,481 B (114,217 B gzipped), 3.8 ms — served from the in-process index |
+| `GET /api/fundamentals/KO`, first read | 6.78 s, 1,991 B — five fiscal years, thirteen metrics, share count and trailing EPS |
+| `GET /api/fundamentals/KO` again, from the in-process cache | 0.51 ms |
+| The two reads behind that response, on a fresh DuckDB with the server's settings | 3.4 s (`stock_shares_outstanding` + `stock_tailing_eps`) + 3.0 s (`stock_statement`); 1.5 s + 1.5 s for the next symbol, whose file footers are already cached |
+| `npm run build` | 0.21 s — 124.77 kB gzipped JS, 1.56 kB gzipped CSS |
+
+### Why it is shaped this way
+
+**One query per symbol, sliced in the browser.** Fetching a symbol's row group
+costs 2–3 s; every further range within a row group the process has already read
+costs about 40 ms. So the page asks for `range=max` once and slices `1Y`/`5Y`/`MAX`
+client-side — switching the range never touches the network, and a symbol is
+loaded once. The server still accepts `range` for anything else that wants it.
+
+**The index is built at boot.** `stock_profile` (2.5 MiB) and the SEC's
+`company_tickers.json` (1.4 MB) are read once at startup and merged into 11,908
+searchable symbols; search is then a linear scan with no I/O and answers in ~4 ms.
+The 39 s `SELECT DISTINCT symbol` that marks which symbols actually have price
+history is *not* on the boot path: the server starts listening first and fills
+`priced` in the background, so an early search still works and simply reports
+`priced: false`.
+
+**Search ranking without popularity data.** Nothing in these tables says which
+Apple is *the* Apple, so the ordering leans on structure and then on heuristics:
+exact symbol, symbol prefix, symbol substring or name word-start, then name
+substring; ties go to symbols that have price history, then to the shorter company
+name (Apple Inc. over Applied Industrial Technologies), then to the shorter
+symbol. `appl` lands on `AAPL`, `coca` on `KO`, `johnson` on `JNJ` — and
+mid-word matches like "PINE**APPL**E" sort below word-starts instead of above them.
+
+**One index, filtered twice.** The stocks page gets no ranking machinery of its
+own: `Search` takes a `stocksOnly` flag and skips the entries the filter rejects,
+and `/api/stocks` is that same index in full, so a company the page can browse to
+is one it can search to and both orders come out of the same comparison. The list
+crosses the wire once and is then filtered and paged in the browser — the index is
+already in memory, and a round trip per sector click would cost more than the
+filter does.
+
+**Fundamentals are shaped server-side.** The browser is never told what yfinance
+calls a line item: `stock_statement`'s `item_name` values are mapped to keys,
+labels and units in one table in `dataset.go`, so a rename upstream breaks one line
+and not a page. The statements, the share count and the trailing EPS travel in one
+response, and market cap and P/E are composed in the browser from the close the
+chart has already loaded — one read per symbol, not three.
+
+**Chart.** `lightweight-charts` draws candles in pane 0 and volume in pane 1 with
+an autosizing canvas; the theme is dark to match the page. Each series gets
+`setData` and `fitContent` when the symbol changes, and the chart instance is
+removed on unmount.
+
+**Caching.** Bars are cached per `symbol|range` (256 entries, FIFO) for the life of
+the process, and DuckDB's own object and metadata caches make a re-read of a file
+it has already touched roughly 70× cheaper (2.65 s → 38 ms). The Parquet files
+themselves are never cached locally — that is still the deferred step below.
+
+**Proxy.** DuckDB reads `HTTP_PROXY`/`HTTPS_PROXY` but cannot parse a proxy URL
+that carries credentials, and a value it cannot parse fails the query, so the four
+variables are read once, unset, and handed to DuckDB as `http_proxy`,
+`http_proxy_username` and `http_proxy_password` — and to the Go HTTP client that
+fetches the ticker file.
+
+### Verification runs
+
+`go vet ./...` is clean and the binary builds from scratch in 17 s. The API was
+checked with `curl` against the running server: `AAPL` 5y returns 1,254 bars from
+2021-09-15 through 2026-09-14 and `max` returns 7,999, a delisted symbol (`TWTR`)
+returns zero bars rather than an error, an unknown symbol is a `404`, and
+`range=2y` is a `400`.
+
+The page was driven in headless Chromium. Searching `appl` lists `AAPL | Apple
+Inc.` first and `coca` lists `KO | COCA COLA CO`; clicking a result swaps the card
+(the quote moved from `333.08 / +0.81 (+0.24%)` to `89.35 / +1.06 (+1.20%)`) and
+refetches only that symbol; the range buttons rewrite the change figure
+(`+59.90%` at 5Y against `+599.07%` at `MAX`) without a request. The chart was
+confirmed to actually paint, without anyone looking at it: read back off the price
+pane's canvas, `AAPL`'s largest pane holds 3,794 candle pixels in the up colour
+and 3,805 in the down colour, and switching `KO` from `1Y` to `MAX` grows the
+painted area from 6,942 to 7,927 pixels.
+
+The stocks page was checked the same way, against the same server. `/api/stocks`
+answers with 8,643 symbols — `AAPL`, `KO`, `BRK-A`, `BRK-B` and `AGM-A` in;
+`SPY`, `VOO`, `TLT` and `AHT-PD` out — and `spy` searched with `stocks=1` loses
+`SPY` and `SPYU` while keeping `SGP` and `SYRE`, where the same query without the
+flag returns `SPY` first. On the page: the sidebar lists `A`, `AA`, `AACG` under
+the count `8,643 stocks`, sector `Technology` narrows that to 1,146 rows, *Show
+100 more* takes the rendered list from 100 to 200, and `aht` — eight results on
+`/` — returns two. Clicking a row of the browse list selects it (`AADX`, market
+cap `$2.01B`, P/E `—` because its trailing EPS is negative), and `coca` selects
+`KO`, whose panel reads `Market cap $384.47B` (`4.30B × 89.35`), `Trailing EPS
+3.32`, `P/E 26.92` and three statement tables of 7, 5 and 3 rows, `Revenue
+$47.94B $47.06B $45.75B $43B $38.66B` in the first. The panel starts 479 px down
+the column, so the heading, the figures and the first table are on screen without
+scrolling at 600, 768, 900 and 1100 px of window height. Switching symbols brings
+the figures with the statements rather than after them: `AAGH` reads `Market cap
+$4.23M` and `Shares outstanding 21.15B` from the same response, with dashes for
+trailing EPS and P/E, which is what the dataset holds for it — 36 of 39 sampled
+stocks carry a trailing EPS, and the gap sits in the small listings. The narrow
+layout was swept too, and the figures are fully in view at 900, 820, 768 and 700
+px wide on a 768 px window, 664 px down; at 900×600 they need a small scroll. The
+chart keeps painting
+beside it — 2,487 up and 2,664 down pixels in its candle pane at 1440×768, with
+volume and the time axis on their own canvases — and the explorer page was
+rechecked for regressions: `/` still returns `AHT-PD` for `aht`, has no sector
+filter, no count and no fundamentals panel, keeps its headline, chart, company
+card order, and its chart still fills the column (497 px at 1440×768).
+`npm run dev` on `:5173` serves the page
+and proxies `/api` to the Go process, checked with `curl` through the dev server.
+
+The image was then built and run the same way. `docker compose up -d --build
+explorer` takes 48 s here once the base images are pulled — `npm ci` 8 s, `go mod
+download` 24 s and `go build` 21 s, the Go stages in parallel with the frontend —
+and produces a 144 MB image whose binary is 60 MB. Inside the container the API
+answers exactly as it does on the host: `11,908` symbols and `12,298` priced ones
+reported by `/api/health`, `AAPL` 5y in 3.57 s on the first read and 5 ms from the
+cache, `max` in 41 ms, 5y gzipped to 21,077 B. It reported `healthy` 10 s after
+start, with the `HEALTHCHECK` the image carries; the page loaded against the
+running container, `appl` listed `AAPL | Apple Inc.` first, and searching it
+painted the chart — 2,985 candle pixels in the up colour and 2,973 in the down
+colour in the largest pane. The dataset index warms in 4.5–5.3 s
+and the priced scan runs on behind it, so `/api/health` reads `"pricedDone": true`
+about a minute after a start with the default memory limit — 58 s here against the
+host's 39 s, which asks DuckDB for the whole machine; `EXPLORER_MEMORY` is the
+knob if boot time matters.
+
+The image was rebuilt with the stocks page in it and the check repeated. It serves
+the same numbers as the host: `/api/stocks` returns 8,643 symbols, 634,481 B,
+114,219 B gzipped, in 4.3 ms; `/api/fundamentals/KO` takes 7.8 s on its first read
+with the priced scan still running, then 0.4 ms, with the same five periods,
+`$384.47B` market cap and `26.92` P/E on the page; `SPY` is a `404`; `/stocks` is
+a `200`. The image was rebuilt and checked once more after the close moved into
+the fundamentals response and the narrow layout was fixed: it serves the current
+bundle (`index-dAgGe8Hr.js`), `AAGH` comes back with `close 0.0002` and no
+trailing EPS — `$4.23M` market cap, dashes for EPS and P/E on the page — and the
+panel's figures sit 504 px down the column at 1440×768 and 664 px at 900×768,
+above the fold in both, exactly as on the host.
+`docker compose --profile explorer down` removes the container and leaves
+the image — without the profile the command silently matches nothing, which is why
+that line carries it.
 
 ## Docker Compose
 
