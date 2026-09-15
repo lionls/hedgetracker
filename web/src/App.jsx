@@ -1,12 +1,21 @@
 import { useEffect, useMemo, useState } from 'react';
 import Chart from './Chart.jsx';
-import { companyFor, historyFor, searchSymbols, sliceHistory } from './api.js';
+import Fundamentals from './Fundamentals.jsx';
+import { companyFor, historyFor, searchSymbols, sliceHistory, stocksList } from './api.js';
 
 const RANGES = ['1y', '5y', 'max'];
 
-export default function App() {
+// BROWSE_STEP is how much of the stocks list grows per click: rendering the
+// whole ten-thousand-row list costs more than the chart does.
+const BROWSE_STEP = 100;
+
+export default function App({ page = 'explorer' }) {
+  const stocksOnly = page === 'stocks';
   const [query, setQuery] = useState('');
   const [results, setResults] = useState([]);
+  const [stocks, setStocks] = useState(null);
+  const [sector, setSector] = useState('');
+  const [visible, setVisible] = useState(BROWSE_STEP);
   const [symbol, setSymbol] = useState('AAPL');
   const [range, setRange] = useState('5y');
   const [history, setHistory] = useState(null);
@@ -15,10 +24,28 @@ export default function App() {
   const [error, setError] = useState('');
 
   useEffect(() => {
+    if (!stocksOnly) return undefined;
+    let active = true;
+    stocksList().then(
+      (list) => active && setStocks(list),
+      () => active && setStocks([]),
+    );
+    return () => {
+      active = false;
+    };
+  }, [stocksOnly]);
+
+  useEffect(() => {
+    // Browsing stocks: the list is already in memory, so nothing is asked of
+    // the search endpoint until there is something to search for.
+    if (stocksOnly && !query) {
+      setResults([]);
+      return undefined;
+    }
     const controller = new AbortController();
     const timer = setTimeout(
       () => {
-        searchSymbols(query, controller.signal).then(setResults, () => {});
+        searchSymbols(query, controller.signal, stocksOnly).then(setResults, () => {});
       },
       query ? 150 : 0,
     );
@@ -26,7 +53,7 @@ export default function App() {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [query]);
+  }, [query, stocksOnly]);
 
   useEffect(() => {
     let active = true;
@@ -56,6 +83,26 @@ export default function App() {
 
   const view = useMemo(() => sliceHistory(history, range), [history, range]);
 
+  // Browsing is a plain filter over a list that is already in memory; ranking
+  // stays on the server, where the empty-query case never reaches.
+  const sectors = useMemo(() => {
+    if (!stocks) return [];
+    const names = new Set();
+    for (const stock of stocks) {
+      if (stock.sector) names.add(stock.sector);
+    }
+    return [...names].sort();
+  }, [stocks]);
+
+  const browsed = useMemo(() => {
+    if (!stocks) return [];
+    return sector ? stocks.filter((stock) => stock.sector === sector) : stocks;
+  }, [stocks, sector]);
+
+  useEffect(() => setVisible(BROWSE_STEP), [sector, stocksOnly]);
+
+  const listed = stocksOnly && !query ? browsed.slice(0, visible) : results;
+
   const stats = useMemo(() => {
     const { candles } = view;
     if (candles.length === 0) return null;
@@ -77,8 +124,16 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand">
           hedgetracker
-          <span>market explorer</span>
+          <span>{stocksOnly ? 'stocks' : 'market explorer'}</span>
         </div>
+        <nav className="pages">
+          <a className={stocksOnly ? 'page' : 'page active'} href="/">
+            Explorer
+          </a>
+          <a className={stocksOnly ? 'page active' : 'page'} href="/stocks">
+            Stocks
+          </a>
+        </nav>
         <input
           className="search"
           type="search"
@@ -88,11 +143,26 @@ export default function App() {
           spellCheck={false}
           onChange={(event) => setQuery(event.target.value)}
           onKeyDown={(event) => {
-            if (event.key === 'Enter' && results[0]) setSymbol(results[0].symbol);
+            if (event.key === 'Enter' && listed[0]) setSymbol(listed[0].symbol);
           }}
         />
+        {stocksOnly && !query ? (
+          <select className="sector" value={sector} onChange={(event) => setSector(event.target.value)}>
+            <option value="">All sectors</option>
+            {sectors.map((sectorName) => (
+              <option key={sectorName} value={sectorName}>
+                {sectorName}
+              </option>
+            ))}
+          </select>
+        ) : null}
+        {stocksOnly ? (
+          <p className="count">
+            {query ? `${results.length} matches` : `${browsed.length.toLocaleString('en-US')} stocks`}
+          </p>
+        ) : null}
         <ul className="results">
-          {results.map((result) => (
+          {listed.map((result) => (
             <li key={result.symbol}>
               <button
                 type="button"
@@ -106,6 +176,11 @@ export default function App() {
             </li>
           ))}
         </ul>
+        {stocksOnly && !query && browsed.length > visible ? (
+          <button type="button" className="more" onClick={() => setVisible(visible + BROWSE_STEP)}>
+            Show {Math.min(BROWSE_STEP, browsed.length - visible).toLocaleString('en-US')} more
+          </button>
+        ) : null}
       </aside>
 
       <main className="main">
@@ -154,6 +229,8 @@ export default function App() {
           <Chart candles={view.candles} volume={view.volume} />
           {loading ? <div className="overlay">loading {symbol}…</div> : null}
         </section>
+
+        {stocksOnly ? <Fundamentals symbol={symbol} /> : null}
 
         <section className="company">
           <dl>

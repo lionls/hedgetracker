@@ -67,6 +67,68 @@ body {
   border-color: #3d4a5c;
 }
 
+.pages {
+  display: flex;
+  gap: 6px;
+  padding: 0 14px 12px;
+}
+
+.page {
+  padding: 4px 10px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  text-decoration: none;
+}
+
+.page:hover {
+  color: var(--text);
+}
+
+.page.active {
+  border-color: #3d4a5c;
+  background: #1d2733;
+  color: var(--text);
+}
+
+.sector {
+  margin: 0 14px 10px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #171c24;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+}
+
+.count {
+  margin: 0 16px 8px;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.more {
+  margin: 0 14px 14px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.more:hover {
+  background: #171d26;
+  color: var(--text);
+}
+
 .results {
   flex: 1;
   min-height: 0;
@@ -286,6 +348,91 @@ body {
   margin: 10px 0 0;
 }
 
+.fundamentals {
+  padding: 4px 20px 40px;
+  border-top: 1px solid var(--line);
+}
+
+.fundamentals header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 28px;
+  align-items: baseline;
+  padding: 16px 0 4px;
+}
+
+.fundamentals h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.figures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 26px;
+  margin: 0;
+}
+
+.figures dt {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.figures dd {
+  margin: 2px 0 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.statements {
+  width: 100%;
+  margin-top: 14px;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.statements caption {
+  padding-bottom: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: left;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.statements th,
+.statements td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.statements thead th {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.statements th[scope='row'] {
+  color: var(--muted);
+  font-weight: 400;
+  text-align: left;
+}
+
+.statements td {
+  font-size: 13px;
+}
+
+.note {
+  max-width: 80ch;
+  margin: 14px 0 0;
+  font-size: 11px;
+}
+
 @media (max-width: 900px) {
   .app {
     grid-template-columns: minmax(0, 1fr);
@@ -296,11 +443,27 @@ body {
   .sidebar {
     border-right: 0;
     border-bottom: 1px solid var(--line);
-    max-height: 45vh;
+    /* The sidebar and the chart both precede the panel in this layout, and the
+       panel is the reason the page exists, so both give ground here: at 32vh
+       plus a 280 px chart the figures clear the fold on a 768 px-tall window,
+       where 45vh and a 320 px chart put them 65 px below it. The browse list
+       scrolls inside the sidebar either way. */
+    max-height: 32vh;
   }
 
-  .panel,
+  .panel {
+    min-height: 0;
+  }
+
+  /* A minimum does not work here: the chart's canvas is laid out at its initial
+     height and holds the panel open, so the narrow layout states a height. At
+     280 px the panel's figures clear the fold on a 768 px-tall window. */
   .chart {
-    min-height: 320px;
+    height: 280px;
+    min-height: 0;
+  }
+
+  .fundamentals {
+    overflow-x: auto;
   }
 }

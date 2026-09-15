@@ -25,10 +25,26 @@ async function getJSON(path) {
   return response.json();
 }
 
-export function searchSymbols(query, signal) {
-  return fetch(`${API}/search?q=${encodeURIComponent(query)}&limit=30`, { signal })
+export function searchSymbols(query, signal, stocksOnly) {
+  const filter = stocksOnly ? '&stocks=1' : '';
+  return fetch(`${API}/search?q=${encodeURIComponent(query)}&limit=30${filter}`, { signal })
     .then((response) => (response.ok ? response.json() : Promise.reject(new Error('search failed'))))
     .then((payload) => payload.results);
+}
+
+// stocksList loads the browse list of the stocks page once: every operating
+// company the dataset knows, alphabetical. It is that page's whole universe, so
+// browsing, the sector filter and the search all share one request.
+export function stocksList() {
+  return cached('stocks', () => getJSON('/stocks').then((payload) => payload.stocks));
+}
+
+// fundamentalsFor resolves null for symbols the dataset filed no statements
+// for — every fund — which is an answer rather than an error.
+export function fundamentalsFor(symbol) {
+  return cached(`fundamentals:${symbol}`, () =>
+    getJSON(`/fundamentals/${encodeURIComponent(symbol)}`).catch(() => null),
+  );
 }
 
 export function companyFor(symbol) {

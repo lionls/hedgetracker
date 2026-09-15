@@ -56,6 +56,44 @@ type Bars struct {
 	Volume []int64   `json:"volume"`
 }
 
+// Stock is one row of the stocks page's browse list: a symbol, the name it is
+// listed under, and the sector the list is grouped by.
+type Stock struct {
+	Symbol string `json:"symbol"`
+	Name   string `json:"name"`
+	Sector string `json:"sector,omitempty"`
+}
+
+// MetricRow is one line of the fundamentals panel: the same metric for every
+// fiscal period in the payload, in the same order. Values are pointers so a
+// hole in the dataset renders as a gap instead of a zero.
+type MetricRow struct {
+	Key    string     `json:"key"`
+	Label  string     `json:"label"`
+	Unit   string     `json:"unit,omitempty"`
+	Values []*float64 `json:"values"`
+}
+
+// MetricGroup bundles rows under the statement they come from, so the panel
+// renders in statement order without sorting anything itself.
+type MetricGroup struct {
+	Name string      `json:"name"`
+	Rows []MetricRow `json:"rows"`
+}
+
+// Fundamentals is the fundamentals panel for one company: a curated metric set
+// per fiscal year, newest first, plus the market figures the header derives
+// market cap and P/E from. They travel together because the panel needs all of
+// them at once, and none of them should wait on the chart's own bars.
+type Fundamentals struct {
+	Symbol   string        `json:"symbol"`
+	Periods  []string      `json:"periods"`
+	Groups   []MetricGroup `json:"groups"`
+	Shares   int64         `json:"shares,omitempty"`
+	Trailing float64       `json:"trailingEps,omitempty"`
+	Close    float64       `json:"close,omitempty"`
+}
+
 // Dataset holds the boot-time ticker index and the per-request caches. The
 // Parquet files stay on Hugging Face: every cold read is an HTTPS range read,
 // which costs a couple of seconds, so decoded results are cached in memory.
@@ -69,13 +107,22 @@ type Dataset struct {
 	profiles map[string]Profile
 	priced   map[string]bool
 	index    []Entry
+	stocks   []Stock
+	stockSet map[string]bool
 
 	barsMu    sync.Mutex
 	bars      map[string]*Bars
 	barsOrder []string
+
+	fundMu    sync.Mutex
+	fund      map[string]*Fundamentals
+	fundOrder []string
 }
 
-const barsCacheSize = 256
+const (
+	barsCacheSize = 256
+	fundCacheSize = 256
+)
 
 // NewDataset prepares the client used for the plain-HTTP parts of the dataset
 // (the ticker file is small JSON, DuckDB would only add overhead).
@@ -91,6 +138,7 @@ func NewDataset(db *sql.DB, proxy *url.URL) *Dataset {
 		profiles: map[string]Profile{},
 		priced:   map[string]bool{},
 		bars:     map[string]*Bars{},
+		fund:     map[string]*Fundamentals{},
 	}
 }
 
@@ -274,14 +322,21 @@ func (d *Dataset) fetchProfiles(ctx context.Context) (map[string]Profile, error)
 func (d *Dataset) rebuildIndexLocked() {
 	index := make([]Entry, 0, len(d.profiles)+len(d.names))
 	seen := make(map[string]bool, cap(index))
+	stocks := make([]Stock, 0, len(d.profiles))
+	stockSet := make(map[string]bool, len(d.profiles))
 	for symbol, profile := range d.profiles {
+		name := nameOr(d.names[symbol], symbol)
 		index = append(index, Entry{
 			Symbol: symbol,
-			Name:   nameOr(d.names[symbol], symbol),
+			Name:   name,
 			Sector: profile.Sector,
 			Priced: d.priced[symbol],
 		})
 		seen[symbol] = true
+		if isStock(symbol, profile.Sector, profile.Industry) {
+			stocks = append(stocks, Stock{Symbol: symbol, Name: name, Sector: profile.Sector})
+			stockSet[symbol] = true
+		}
 	}
 	for symbol, name := range d.names {
 		if seen[symbol] {
@@ -290,7 +345,31 @@ func (d *Dataset) rebuildIndexLocked() {
 		index = append(index, Entry{Symbol: symbol, Name: name, Priced: d.priced[symbol]})
 	}
 	sort.Slice(index, func(i, j int) bool { return index[i].Symbol < index[j].Symbol })
-	d.index = index
+	sort.Slice(stocks, func(i, j int) bool { return stocks[i].Symbol < stocks[j].Symbol })
+	d.index, d.stocks, d.stockSet = index, stocks, stockSet
+}
+
+// isStock reports whether a profile describes an operating company. yfinance
+// leaves the company fields empty for funds and trusts, and the shells it does
+// describe — SPAC units and their warrants — all sit in "Shell Companies". The
+// dash forms left over are share classes (BRK-B), which belong on the page, and
+// preferred and when-issued lines, which do not.
+func isStock(symbol, sector, industry string) bool {
+	if sector == "" || industry == "Shell Companies" {
+		return false
+	}
+	dash := strings.LastIndex(symbol, "-")
+	if dash < 0 {
+		return true
+	}
+	if tail := symbol[dash+1:]; len(tail) == 2 && tail[0] == 'P' {
+		return false
+	}
+	switch symbol[dash+1:] {
+	case "CL", "RT", "UN", "WI", "WS", "WT":
+		return false
+	}
+	return true
 }
 
 func nameOr(name, fallback string) string {
@@ -301,15 +380,19 @@ func nameOr(name, fallback string) string {
 }
 
 // Search ranks symbol matches above name matches, because a search box for a
-// chart is almost always fed a ticker.
-func (d *Dataset) Search(query string, limit int) []Entry {
+// chart is almost always fed a ticker. With stocksOnly the candidates are the
+// operating companies the stocks page lists.
+func (d *Dataset) Search(query string, limit int, stocksOnly bool) []Entry {
 	d.mu.RLock()
-	index := d.index
+	index, stockSet := d.index, d.stockSet
 	d.mu.RUnlock()
 
 	upper := strings.ToUpper(strings.TrimSpace(query))
 	matches := make([]scored, 0, 64)
 	for _, entry := range index {
+		if stocksOnly && !stockSet[entry.Symbol] {
+			continue
+		}
 		rank, ok := rankEntry(entry, upper)
 		if !ok {
 			continue
@@ -380,6 +463,14 @@ func lessRanked(a, b scored) bool {
 		return len(a.entry.Symbol) < len(b.entry.Symbol)
 	}
 	return a.entry.Symbol < b.entry.Symbol
+}
+
+// Stocks returns the stocks page's browse list, alphabetical. It is rebuilt
+// only when the index is, so callers must treat the slice as read-only.
+func (d *Dataset) Stocks() []Stock {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.stocks
 }
 
 // Company returns the stored profile, with the SEC name filled in when the
@@ -484,5 +575,194 @@ func (d *Dataset) storeBars(key string, bars *Bars) {
 	for len(d.barsOrder) > barsCacheSize {
 		delete(d.bars, d.barsOrder[0])
 		d.barsOrder = d.barsOrder[1:]
+	}
+}
+
+// fundamentalsSpec is the metric set the panel shows, in render order. The keys
+// are the dataset's own yfinance item names: the panel only ever sees the
+// labels, so a rename upstream breaks one line here and nothing else.
+var fundamentalsSpec = []struct {
+	group string
+	key   string
+	label string
+	unit  string
+}{
+	{"Income statement", "total_revenue", "Revenue", "usd"},
+	{"Income statement", "gross_profit", "Gross profit", "usd"},
+	{"Income statement", "operating_income", "Operating income", "usd"},
+	{"Income statement", "net_income", "Net income", "usd"},
+	{"Income statement", "diluted_eps", "Diluted EPS", "perShare"},
+	{"Balance sheet", "total_assets", "Total assets", "usd"},
+	{"Balance sheet", "total_liabilities_net_minority_interest", "Total liabilities", "usd"},
+	{"Balance sheet", "stockholders_equity", "Shareholders' equity", "usd"},
+	{"Balance sheet", "total_debt", "Total debt", "usd"},
+	{"Balance sheet", "cash_and_cash_equivalents", "Cash and equivalents", "usd"},
+	{"Cash flow", "operating_cash_flow", "Operating cash flow", "usd"},
+	{"Cash flow", "free_cash_flow", "Free cash flow", "usd"},
+	{"Cash flow", "capital_expenditure", "Capital expenditure", "usd"},
+}
+
+// fundYears is how many fiscal years the panel shows.
+const fundYears = 5
+
+// Fundamentals returns the curated metric set per fiscal year, newest first.
+// The second result is false for symbols the dataset has no annual statements
+// for, which is every fund. The first call for a symbol pays for the HTTPS
+// range reads; later calls are served from memory, like Bars.
+func (d *Dataset) Fundamentals(ctx context.Context, symbol string) (*Fundamentals, bool, error) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if cached, ok := d.cachedFundamentals(symbol); ok {
+		return cached, true, nil
+	}
+
+	items := make([]string, len(fundamentalsSpec))
+	for i, metric := range fundamentalsSpec {
+		items[i] = metric.key
+	}
+	query := fmt.Sprintf(`SELECT report_date, item_name, CAST(item_value AS DOUBLE) FROM %s
+		WHERE symbol = ? AND period_type = 'annual' AND item_name IN (%s)
+		ORDER BY report_date DESC`,
+		d.table("stock_statement"), placeholders(len(items)))
+	args := make([]any, 0, len(items)+1)
+	args = append(args, symbol)
+	for _, item := range items {
+		args = append(args, item)
+	}
+	rows, err := d.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, false, fmt.Errorf("query stock_statement: %w", err)
+	}
+	defer rows.Close()
+
+	// periods stays newest first, which is the order the rows arrive in.
+	periods := make([]string, 0, fundYears)
+	statements := map[string]map[string]float64{}
+	for rows.Next() {
+		var date, item string
+		var value sql.NullFloat64
+		if err := rows.Scan(&date, &item, &value); err != nil {
+			return nil, false, fmt.Errorf("scan stock_statement: %w", err)
+		}
+		if !value.Valid {
+			continue
+		}
+		period, ok := statements[date]
+		if !ok {
+			if len(periods) == fundYears {
+				continue
+			}
+			period = make(map[string]float64, len(fundamentalsSpec))
+			statements[date] = period
+			periods = append(periods, date)
+		}
+		period[item] = value.Float64
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("read stock_statement: %w", err)
+	}
+	if len(periods) == 0 {
+		return nil, false, nil
+	}
+
+	byGroup := map[string][]MetricRow{}
+	for _, metric := range fundamentalsSpec {
+		row := MetricRow{Key: metric.key, Label: metric.label, Unit: metric.unit, Values: make([]*float64, len(periods))}
+		for i, period := range periods {
+			if value, ok := statements[period][metric.key]; ok {
+				value := value
+				row.Values[i] = &value
+			}
+		}
+		byGroup[metric.group] = append(byGroup[metric.group], row)
+	}
+
+	fundamentals := &Fundamentals{Symbol: symbol, Periods: periods}
+	for _, metric := range fundamentalsSpec {
+		if group := byGroup[metric.group]; group != nil {
+			fundamentals.Groups = append(fundamentals.Groups, MetricGroup{Name: metric.group, Rows: group})
+			delete(byGroup, metric.group)
+		}
+	}
+	shares, trailing, close, ok := d.marketFigures(ctx, symbol)
+	fundamentals.Shares, fundamentals.Trailing, fundamentals.Close = shares, trailing, close
+
+	// A failed figures read is served but not cached: the statements are worth
+	// having either way, while caching the zeroes would pin dashes on the
+	// symbol for the life of the process when a retry would fill them in.
+	if ok {
+		d.storeFundamentals(symbol, fundamentals)
+	}
+	return fundamentals, true, nil
+}
+
+// marketFigures reads the three figures the panel header turns into market cap
+// and P/E: the latest share count, the latest trailing EPS and the latest
+// close. None is guaranteed to exist — the panel prints a dash for what the
+// dataset does not hold — but the close rides along here so those figures never
+// depend on whether the chart loaded its own bars. The last result is false
+// when the reads failed, which is what keeps the empty figures out of the cache.
+func (d *Dataset) marketFigures(ctx context.Context, symbol string) (int64, float64, float64, bool) {
+	query := fmt.Sprintf(`SELECT 'shares', CAST(arg_max(shares_outstanding, report_date) AS DOUBLE) FROM %s WHERE symbol = ?
+		UNION ALL SELECT 'eps', CAST(arg_max(tailing_eps, report_date) AS DOUBLE) FROM %s WHERE symbol = ?
+		UNION ALL SELECT 'close', CAST(arg_max(close, report_date) AS DOUBLE) FROM %s WHERE symbol = ?`,
+		d.table("stock_shares_outstanding"), d.table("stock_tailing_eps"), d.table("stock_prices"))
+	rows, err := d.db.QueryContext(ctx, query, symbol, symbol, symbol)
+	if err != nil {
+		log.Printf("dataset: market figures for %s unavailable: %v", symbol, err)
+		return 0, 0, 0, false
+	}
+	defer rows.Close()
+
+	var shares int64
+	var trailing, close float64
+	for rows.Next() {
+		var kind string
+		var value sql.NullFloat64
+		if err := rows.Scan(&kind, &value); err != nil {
+			log.Printf("dataset: market figures for %s unavailable: %v", symbol, err)
+			return 0, 0, 0, false
+		}
+		if !value.Valid {
+			continue
+		}
+		switch kind {
+		case "shares":
+			shares = int64(value.Float64)
+		case "eps":
+			trailing = value.Float64
+		default:
+			close = value.Float64
+		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("dataset: market figures for %s unavailable: %v", symbol, err)
+		return 0, 0, 0, false
+	}
+	return shares, trailing, close, true
+}
+
+// placeholders returns the "?,?,?" of an IN list of n values; n is always at
+// least one because the specs it is built from are never empty.
+func placeholders(n int) string {
+	return strings.Repeat(",?", n)[1:]
+}
+
+func (d *Dataset) cachedFundamentals(symbol string) (*Fundamentals, bool) {
+	d.fundMu.Lock()
+	defer d.fundMu.Unlock()
+	fundamentals, ok := d.fund[symbol]
+	return fundamentals, ok
+}
+
+func (d *Dataset) storeFundamentals(symbol string, fundamentals *Fundamentals) {
+	d.fundMu.Lock()
+	defer d.fundMu.Unlock()
+	if _, exists := d.fund[symbol]; !exists {
+		d.fundOrder = append(d.fundOrder, symbol)
+	}
+	d.fund[symbol] = fundamentals
+	for len(d.fundOrder) > fundCacheSize {
+		delete(d.fund, d.fundOrder[0])
+		d.fundOrder = d.fundOrder[1:]
 	}
 }

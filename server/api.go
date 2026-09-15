@@ -24,8 +24,10 @@ func (a *API) routes() http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/health", a.health)
 	api.HandleFunc("GET /api/search", a.search)
+	api.HandleFunc("GET /api/stocks", a.stocks)
 	api.HandleFunc("GET /api/company/{symbol}", a.company)
 	api.HandleFunc("GET /api/bars/{symbol}", a.bars)
+	api.HandleFunc("GET /api/fundamentals/{symbol}", a.fundamentals)
 
 	root := http.NewServeMux()
 	root.Handle("/api/", gzipHandler(api))
@@ -54,8 +56,35 @@ func (a *API) search(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	query := r.URL.Query().Get("q")
-	results := a.dataset.Search(query, limit)
+	stocksOnly := r.URL.Query().Get("stocks") == "1"
+	results := a.dataset.Search(query, limit, stocksOnly)
 	writeJSON(w, http.StatusOK, map[string]any{"query": query, "results": results})
+}
+
+// stocks serves the browse list of the stocks page: every operating company in
+// the dataset, alphabetical. It is built at warm time and served from memory.
+func (a *API) stocks(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"stocks": a.dataset.Stocks()})
+}
+
+// fundamentals serves the statements the stocks page shows under the chart. A
+// symbol the dataset never filed statements for — any fund — is a 404.
+func (a *API) fundamentals(w http.ResponseWriter, r *http.Request) {
+	symbol := r.PathValue("symbol")
+	if !validSymbol(symbol) {
+		writeError(w, http.StatusBadRequest, "invalid symbol")
+		return
+	}
+	fundamentals, ok, err := a.dataset.Fundamentals(r.Context(), symbol)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, "no fundamentals for symbol")
+		return
+	}
+	writeJSON(w, http.StatusOK, fundamentals)
 }
 
 func (a *API) company(w http.ResponseWriter, r *http.Request) {
