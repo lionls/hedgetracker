@@ -256,23 +256,29 @@ stays as it is — the deeper history, folded from minute bars.
 ### The supplementary source
 
 [`defeatbeta/yahoo-finance-data`](https://huggingface.co/datasets/defeatbeta/yahoo-finance-data)
-publishes 15 Parquet tables under `data/`, built from Yahoo Finance, Nasdaq and US
-Treasury data for research and educational use, licensed ODC-BY, and refreshed
-daily: `spec.json` carries the `update_time`, which read `2026-09-14T05:09:09Z`
-when the numbers below were taken. Its daily bars are a finished table, so there
-is nothing to fold and — for now — nothing to cache: each table is read over
-HTTPS, straight off the Hub.
+publishes 15 Parquet tables under `data/US/`, built from Yahoo Finance, Nasdaq and
+US Treasury data for research and educational use, licensed ODC-BY, and refreshed
+daily: `spec.json` sits at the repo root, one level above `data/`, carrying the
+`update_time` — `2026-09-15T05:10:40Z` when the numbers below were taken — and a
+sha256 per file; the revision itself is `6d603343ced0d83114a529bed4872a12ae0b7c8b`.
+Its daily bars are a finished table, so there is nothing to fold and — for now —
+nothing to cache: each table is read over HTTPS, straight off the Hub. The tables
+moved under a country directory at some point, so an older `resolve/main/data/…`
+path that used to work — as the first revision of this section had it — returns
+404 and the prefix is `data/US/` everywhere below.
 
 ```sql
 SELECT symbol, report_date, close, volume
-FROM 'https://huggingface.co/datasets/defeatbeta/yahoo-finance-data/resolve/main/data/stock_prices.parquet'
+FROM 'https://huggingface.co/datasets/defeatbeta/yahoo-finance-data/resolve/main/data/US/stock_prices.parquet'
 WHERE symbol = 'KO'
 ORDER BY report_date DESC
 LIMIT 5;
 ```
 
-Every table follows the same shape, `resolve/main/data/<table>.parquet`. DuckDB
-reads the Parquet footer first and then only the column chunks a query names, so a
+Every table follows the same shape, `resolve/main/data/US/<table>.parquet`, with
+the SEC's `company_tickers.json` (1.4 MB, 10,432 tickers) sitting beside them in
+`data/US/` even though it is not one of the 15. DuckDB reads the Parquet footer
+first and then only the column chunks a query names, so a
 filtered query touches a fraction of a 445 MiB file. Two things to remember when
 running it from a sandbox like this one: DuckDB reads `HTTP_PROXY`/`HTTPS_PROXY`
 itself but cannot parse a proxy URL that carries credentials, and a value it
@@ -285,13 +291,17 @@ there is written inside `data/` and has filled the disk before.
 
 | Table | Size | Rows | Contents |
 | --- | --- | --- | --- |
-| `stock_prices` | 445 MiB | 36,678,606 | `symbol`, `report_date`, `open`, `close`, `high`, `low`, `volume` — `DECIMAL(16,4)` prices, `BIGINT` volume |
-| `stock_split_events` | 67 KiB | 9,943 | `split_factor` as a ratio string (`4:1`) |
-| `stock_dividend_events` | 702 KiB | 305,630 | cash amount per share, by ex-date |
-| `stock_shares_outstanding` | 5.7 MiB | 1,169,882 | shares outstanding, by `report_date` |
-| `stock_profile` | 2.5 MiB | 11,351 | sector, industry, employees, address |
-| `exchange_rate` | 3.1 MiB | 243,207 | `EUR=X`-style pairs with OHLC |
-| `stock_sec_filing` | 87 MiB | 7,830,197 | `cik`, `accession_number`, `form_type`, `filing_date`, `filing_url`, 13F-HR included |
+| `stock_prices` | 445 MiB | 36,701,230 | `symbol`, `report_date`, `open`, `close`, `high`, `low`, `volume` — `DECIMAL(16,4)` prices, `BIGINT` volume |
+| `stock_split_events` | 67 KiB | 9,947 | `split_factor` as a ratio string (`4:1`) |
+| `stock_dividend_events` | 700 KiB | 305,713 | cash amount per share, by ex-date |
+| `stock_shares_outstanding` | 5.7 MiB | 1,169,934 | shares outstanding, by `report_date` |
+| `stock_profile` | 2.5 MiB | 11,358 | sector, industry, employees, address |
+| `exchange_rate` | 3.1 MiB | 243,276 | `EUR=X`-style pairs with OHLC |
+| `stock_sec_filing` | 87 MiB | 7,832,949 | `cik`, `accession_number`, `form_type`, `filing_date`, `filing_url`, 13F-HR included |
+
+Sizes and row counts read from the live files on 2026-09-15, at revision
+`6d603343`; the day's refresh added 22,624 bars, 9 symbols and 8 profiles to a
+table that had 36,678,606 bars for 12,289 symbols the day before.
 
 The rest are financials and text — `stock_statement` (112 MiB), `stock_news`
 (1.1 GiB), `stock_earning_call_transcripts` (2.1 GiB), `stock_tailing_eps`,
@@ -300,8 +310,8 @@ The rest are financials and text — `stock_statement` (112 MiB), `stock_news`
 
 #### What `stock_prices` holds
 
-Verified against the live table on 2026-09-14: 36,678,606 bars for 12,289 symbols,
-1994-11-30 through 2026-09-11, with no duplicate `symbol`/`report_date` pair — the
+Verified against the live table on 2026-09-15: 36,701,230 bars for 12,298 symbols,
+1994-11-30 through 2026-09-14, with no duplicate `symbol`/`report_date` pair — the
 join key is unique — and every `report_date` an ISO `YYYY-MM-DD` string, so cast
 it before joining. A symbol's history starts where the symbol starts (`ENPH` from
 2012-03-30, its listing) and any symbol already trading before 1994-11-30 (`AON`,
@@ -317,8 +327,9 @@ alongside the bars.
 CUSIP map bundled with `edgartools`, and the two spell share classes differently:
 edgartools writes `BRKB` where Yahoo writes `BRK-B`. Compare separator-stripped
 (`replace(upper(symbol), '-', '')`) rather than verbatim. Measured over the 3,069
-holding rows and $5.54B of reported value in `data/smoke/13f_holdings`, with each
-CUSIP resolved the way `conform` resolves it:
+holding rows and $5.54B of reported value in `data/smoke/13f_holdings` —
+re-measured on 2026-09-15: 25 Parquet files, 1,098 distinct resolved tickers, none
+the map cannot resolve — with each CUSIP resolved the way `conform` resolves it:
 
 | Join | Rows priced | Reported value priced |
 | --- | --- | --- |
@@ -329,7 +340,7 @@ Normalization is worth 14 rows and $38.8M of that, all of it Berkshire's class B
 What stays unpriced is mostly funds: the lake's largest unmatched positions are
 `VNQ`, `VTEB`, `SHV`, `SCHO`, `DFAC`, `BIL`, `IEF`, `AVUS`, `XLP` and `SCHB`, and
 the only ETFs the table carries are the largest in the market (`SPY`, `QQQ`,
-`IVV`). Across the map as a whole, 10,268 of its 55,145 distinct tickers — 18.6% —
+`IVV`). Across the map as a whole, 10,303 of its 55,145 distinct tickers — 18.7% —
 have bars: the map reaches every SEC-registered security, including funds, foreign
 ordinaries, units and rights, while this table covers listed equities.
 
