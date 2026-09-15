@@ -28,8 +28,9 @@ extract_13f_holdings (task, .map over every filing)
   the reference map bundled with `edgartools` (68,830 CUSIPs). That lookup is
   offline, so it costs no SEC request and covers every era — edgartools itself
   annotates only the XML information tables of 2013 and later — and `ticker` is
-  the key the daily bars join on (see [Market data](#market-data)). A CUSIP the map
-  does not know stays null rather than being guessed at.
+  the key the daily bars join on (see [Market data](#market-data) and the
+  [market explorer](#market-explorer)). A CUSIP the map does not know stays null
+  rather than being guessed at.
 * **Fund-flow ready** — `report_period` is always present, so quarter-over-quarter
   position deltas can be computed per filer.
 
@@ -46,6 +47,12 @@ src/hedgetracker/
 └── flows/
     └── sec_13f.py       # extract_13f_holdings task + extract_quarterly_13f flow
 tests/                   # offline unit tests + `-m live` SEC integration tests
+server/                  # Go + DuckDB backend for the market explorer
+├── main.go              # flags, boot-time warm, graceful shutdown
+├── duck.go              # DuckDB DSN, proxy handling, httpfs
+├── dataset.go           # ticker index, profiles, bars, response caches
+└── api.go               # JSON endpoints + the built frontend
+web/                     # React frontend (Vite, lightweight-charts)
 ```
 
 ## Setup
@@ -356,7 +363,130 @@ The first use is enrichment: join each holding to the bar for its filing date to
 get a price and a position value, carry that quarter over quarter, and take a
 sector from `stock_profile` for grouping. Caching the Parquet files locally is
 deferred until that work needs it — `stock_prices` is 445 MiB and reads fine over
-HTTPS.
+HTTPS. The [market explorer](#market-explorer) below is the first consumer of
+these tables: it fetches a symbol's whole history in one query, which is the shape
+the join wants, and it makes the gap between a ticker the map knows and a ticker
+that has bars visible before any of that work starts.
+
+## Market explorer
+
+`server/` and `web/` are a browser for those tables: a ticker search, a company
+card, a candlestick chart with volume. The Go process answers every request
+straight from the Parquet files on the Hub — no local copy of a table, no database
+file, nothing written outside DuckDB's spill directory in `/tmp` — and the React
+page is a single route with no router and no state library, because the whole app
+is four endpoints and three pieces of state.
+
+| | |
+| --- | --- |
+| Backend | Go 1.26, `github.com/marcboeker/go-duckdb/v2` (cgo, statically linked DuckDB) |
+| Frontend | React 19, Vite 8, `lightweight-charts` 5 |
+| Source of truth | `data/US/` on the Hub, read through DuckDB's `httpfs` |
+| Binary | 70 MB; 17 s to build cold, 2.5 s warm |
+
+### Endpoints
+
+| Route | Answer |
+| --- | --- |
+| `GET /api/health` | `{"status":"ok","tables":"data/US/","symbols":11908,"priced":12298,"pricedDone":true}` |
+| `GET /api/search?q=appl&limit=25` | `{"query":"appl","results":[{"symbol":"AAPL","name":"Apple Inc.","sector":"Technology","priced":true}]}` — `limit` is capped at 200 |
+| `GET /api/company/AAPL` | `{"symbol":"AAPL","name":"Apple Inc.","sector":"Technology","industry":"Consumer Electronics","employees":150000,"website":"https://www.apple.com","city":"Cupertino","country":"United States"}`; `404 {"error":"unknown symbol"}` |
+| `GET /api/bars/AAPL?range=1y\|5y\|max` | `{"symbol":"AAPL","range":"5y","dates":[…],"open":[…],"high":[…],"low":[…],"close":[…],"volume":[…]}`; `range` defaults to `5y` and any other value is a `400` |
+| `GET /*` | `web/dist`, falling back to `index.html` |
+
+The history travels as one array per field instead of one object per bar, which
+makes the JSON — and its gzip — roughly three times smaller, and every `/api/`
+response is gzipped. Price columns are `DECIMAL(16,4)` in the file and cast to
+`DOUBLE` in SQL, volume to `BIGINT`.
+
+### Running it
+
+```sh
+cd web    && npm install && npm run build   # writes web/dist, 0.8 s
+cd server && go build -o marketdata .       # 70 MB, 17 s cold
+cd server && ./marketdata                   # :8080, serving web/dist
+```
+
+For frontend work `npm run dev` in `web/` serves the page on `:5173` with `/api`
+proxied to `:8080`, leaving the Go process running as it is. `-addr` and `-web`
+move the defaults, and `-temp-dir` (default `/tmp/hedgetracker-marketdata`) is
+where DuckDB spills — it must stay outside the repo.
+
+### Measured
+
+Against the running server on 2026-09-15, over the proxy this sandbox uses:
+
+| Step | Measured |
+| --- | --- |
+| Boot: index warm — 10,432 SEC names + 11,358 profiles → 11,908 symbols | 5.1 s cold, 3.4 s with DuckDB's HTTP metadata cache already warm |
+| Boot: `SELECT DISTINCT symbol`, on a background goroutine | 38.9 s, 12,298 symbols |
+| `GET /api/search?q=appl` | 4 ms |
+| `GET /api/bars/AAPL?range=5y`, first read of the file | 2.65 s |
+| `GET /api/bars/AAPL?range=max`, same symbol, 7,999 bars | 38–48 ms |
+| `GET /api/bars/AAPL?range=5y` again, from the in-process cache | 0.98 ms |
+| `GET /api/bars/KO?range=5y`, first read of the file | 3.22 s |
+| `GET /api/bars/MSFT?range=5y`, gzipped | 21,556 B (56,830 B raw) |
+| `GET /api/bars/AAPL?range=max`, gzipped | 126,521 B (407,912 B raw) |
+| `npm run build` | 0.84 s — 123.43 kB gzipped JS, 1.26 kB gzipped CSS |
+
+### Why it is shaped this way
+
+**One query per symbol, sliced in the browser.** Fetching a symbol's row group
+costs 2–3 s; every further range within a row group the process has already read
+costs about 40 ms. So the page asks for `range=max` once and slices `1Y`/`5Y`/`MAX`
+client-side — switching the range never touches the network, and a symbol is
+loaded once. The server still accepts `range` for anything else that wants it.
+
+**The index is built at boot.** `stock_profile` (2.5 MiB) and the SEC's
+`company_tickers.json` (1.4 MB) are read once at startup and merged into 11,908
+searchable symbols; search is then a linear scan with no I/O and answers in ~4 ms.
+The 39 s `SELECT DISTINCT symbol` that marks which symbols actually have price
+history is *not* on the boot path: the server starts listening first and fills
+`priced` in the background, so an early search still works and simply reports
+`priced: false`.
+
+**Search ranking without popularity data.** Nothing in these tables says which
+Apple is *the* Apple, so the ordering leans on structure and then on heuristics:
+exact symbol, symbol prefix, symbol substring or name word-start, then name
+substring; ties go to symbols that have price history, then to the shorter company
+name (Apple Inc. over Applied Industrial Technologies), then to the shorter
+symbol. `appl` lands on `AAPL`, `coca` on `KO`, `johnson` on `JNJ` — and
+mid-word matches like "PINE**APPL**E" sort below word-starts instead of above them.
+
+**Chart.** `lightweight-charts` draws candles in pane 0 and volume in pane 1 with
+an autosizing canvas; the theme is dark to match the page. Each series gets
+`setData` and `fitContent` when the symbol changes, and the chart instance is
+removed on unmount.
+
+**Caching.** Bars are cached per `symbol|range` (256 entries, FIFO) for the life of
+the process, and DuckDB's own object and metadata caches make a re-read of a file
+it has already touched roughly 70× cheaper (2.65 s → 38 ms). The Parquet files
+themselves are never cached locally — that is still the deferred step below.
+
+**Proxy.** DuckDB reads `HTTP_PROXY`/`HTTPS_PROXY` but cannot parse a proxy URL
+that carries credentials, and a value it cannot parse fails the query, so the four
+variables are read once, unset, and handed to DuckDB as `http_proxy`,
+`http_proxy_username` and `http_proxy_password` — and to the Go HTTP client that
+fetches the ticker file.
+
+### Verification runs
+
+`go vet ./...` is clean and the binary builds from scratch in 17 s. The API was
+checked with `curl` against the running server: `AAPL` 5y returns 1,254 bars from
+2021-09-15 through 2026-09-14 and `max` returns 7,999, a delisted symbol (`TWTR`)
+returns zero bars rather than an error, an unknown symbol is a `404`, and
+`range=2y` is a `400`.
+
+The page was driven in headless Chromium. Searching `appl` lists `AAPL | Apple
+Inc.` first and `coca` lists `KO | COCA COLA CO`; clicking a result swaps the card
+(the quote moved from `333.08 / +0.81 (+0.24%)` to `89.35 / +1.06 (+1.20%)`) and
+refetches only that symbol; the range buttons rewrite the change figure
+(`+59.90%` at 5Y against `+599.07%` at `MAX`) without a request. The chart was
+confirmed to actually paint, without anyone looking at it: read back off the price
+pane's canvas, `AAPL`'s largest pane holds 3,794 candle pixels in the up colour
+and 3,805 in the down colour, and switching `KO` from `1Y` to `MAX` grows the
+painted area from 6,942 to 7,927 pixels. `npm run dev` on `:5173` serves the page
+and proxies `/api` to the Go process, checked with `curl` through the dev server.
 
 ## Docker Compose
 

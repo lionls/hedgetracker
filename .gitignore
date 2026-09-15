@@ -10,6 +10,10 @@ build/
 # Data lake output (partitioned Parquet)
 data/
 
+# Market explorer app
+node_modules/
+server/marketdata
+
 # Prefect local state / secrets
 .prefect/
 .env
