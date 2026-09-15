@@ -412,6 +412,47 @@ proxied to `:8080`, leaving the Go process running as it is. `-addr` and `-web`
 move the defaults, and `-temp-dir` (default `/tmp/hedgetracker-marketdata`) is
 where DuckDB spills — it must stay outside the repo.
 
+### Running it on a server
+
+`Dockerfile.explorer` builds the whole app in one image — the Vite bundle in a
+`node:22-bookworm-slim` stage, the cgo binary in `golang:1.26-bookworm`, both
+copied into a `debian:bookworm-slim` runtime — and `docker-compose.yml` carries it
+as an `explorer` service behind a profile, so a bare `docker compose up -d` still
+means the Prefect harness and nothing else:
+
+```sh
+docker compose up -d --build explorer   # build, start, publish :8080
+docker compose logs -f explorer         # index warm, listening, then the priced scan
+docker compose down                     # stops and removes the container, keeps the image
+```
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `EXPLORER_PORT` | `8080` | Published host port; the container always listens on `8080` |
+| `EXPLORER_MEMORY` | `2GB` | DuckDB's memory limit; the boot scan is the one query that wants more |
+| `EXPLORER_THREADS` | `4` | DuckDB threads |
+| `EXPLORER_HTTPS_PROXY` | empty | Sets `HTTPS_PROXY` in the container, for a host that reaches the Hub only through a proxy |
+| `EXPLORER_NO_PROXY` | empty | Hosts to skip for that proxy |
+
+Debian, not Alpine, because `go-duckdb` links DuckDB's C++ static library against
+glibc. Besides that library and `ca-certificates` — the two things `ldd
+marketdata` asks for beyond libc — the image installs nothing. It runs as uid
+`10001`, and the only path it can write to is `/tmp/marketdata` (the
+`marketdata-temp` volume), where DuckDB spills and where it also unpacks the
+`httpfs` extension on first use. Nothing of the dataset is ever on disk, so the
+image is the same 144 MB wherever it runs and a redeploy changes nothing about
+the data.
+
+Two consequences of reading Parquet over HTTPS. The container needs egress to
+`huggingface.co` for every query, which is why `restart: unless-stopped` is there
+to bring it back after a transient failure — and why the healthcheck is the
+binary itself (`-health`, since the image has no `curl`): it stays red until the
+dataset index actually loads. Everything else belongs to the reverse proxy.
+`api.go` gzips `/api/` responses but serves the frontend as-is, so terminate TLS
+and compress the bundle in front of the container if that matters. Only
+`linux/amd64` was built and run here; the Dockerfile is architecture-neutral, and
+`go-duckdb` ships the static DuckDB library for `linux/arm64` too.
+
 ### Measured
 
 Against the running server on 2026-09-15, over the proxy this sandbox uses:
@@ -487,6 +528,22 @@ pane's canvas, `AAPL`'s largest pane holds 3,794 candle pixels in the up colour
 and 3,805 in the down colour, and switching `KO` from `1Y` to `MAX` grows the
 painted area from 6,942 to 7,927 pixels. `npm run dev` on `:5173` serves the page
 and proxies `/api` to the Go process, checked with `curl` through the dev server.
+
+The image was then built and run the same way. `docker compose up -d --build
+explorer` takes 48 s here once the base images are pulled — `npm ci` 8 s, `go mod
+download` 24 s and `go build` 21 s, the Go stages in parallel with the frontend —
+and produces a 144 MB image whose binary is 60 MB. Inside the container the API
+answers exactly as it does on the host: `11,908` symbols and `12,298` priced ones
+reported by `/api/health`, `AAPL` 5y in 3.57 s on the first read and 5 ms from the
+cache, `max` in 41 ms, 5y gzipped to 21,077 B. It reported `healthy` 10 s after
+start, with the `HEALTHCHECK` the image carries; the page loaded against the
+running container, `appl` listed `AAPL | Apple Inc.` first, and searching it
+painted the chart — 2,985 candle pixels in the up colour and 2,973 in the down
+colour in the largest pane. The dataset index warms in 4.5–5.3 s
+and the priced scan runs on behind it, so `/api/health` reads `"pricedDone": true`
+about a minute after a start with the default memory limit — 58 s here against the
+host's 39 s, which asks DuckDB for the whole machine; `EXPLORER_MEMORY` is the
+knob if boot time matters.
 
 ## Docker Compose
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	duckdb "github.com/marcboeker/go-duckdb/v2"
@@ -43,26 +44,34 @@ func proxyFromEnv() *url.URL {
 	return parsed
 }
 
+// dbOptions are the DuckDB settings the server runs with.
+type dbOptions struct {
+	tempDir string
+	memory  string
+	threads int
+	proxy   *url.URL
+}
+
 // openDB returns a pooled DuckDB handle that can read the dataset over HTTPS.
-func openDB(tempDir string, proxy *url.URL) (*sql.DB, error) {
+func openDB(opts dbOptions) (*sql.DB, error) {
 	params := url.Values{}
-	params.Set("threads", "4")
-	params.Set("memory_limit", "2GB")
-	params.Set("temp_directory", tempDir)
+	params.Set("threads", strconv.Itoa(opts.threads))
+	params.Set("memory_limit", opts.memory)
+	params.Set("temp_directory", opts.tempDir)
 	params.Set("preserve_insertion_order", "false")
 	// Remote Parquet is re-read per query, so keep the footer and schema caches on:
 	// they turn a repeat query on an already-seen file into a metadata-free read.
 	params.Set("enable_http_metadata_cache", "true")
 	params.Set("enable_object_cache", "true")
-	if proxy != nil {
-		host := proxy.Host
-		if proxy.Port() == "" {
-			host = proxy.Hostname() + ":80"
+	if opts.proxy != nil {
+		host := opts.proxy.Host
+		if opts.proxy.Port() == "" {
+			host = opts.proxy.Hostname() + ":80"
 		}
 		params.Set("http_proxy", host)
-		if proxy.User != nil {
-			params.Set("http_proxy_username", proxy.User.Username())
-			if password, ok := proxy.User.Password(); ok {
+		if opts.proxy.User != nil {
+			params.Set("http_proxy_username", opts.proxy.User.Username())
+			if password, ok := opts.proxy.User.Password(); ok {
 				params.Set("http_proxy_password", password)
 			}
 		}

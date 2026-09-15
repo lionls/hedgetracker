@@ -7,11 +7,14 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -20,10 +23,19 @@ func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	webDir := flag.String("web", "web/dist", "built frontend directory")
 	tempDir := flag.String("temp-dir", filepath.Join(os.TempDir(), "hedgetracker-marketdata"), "DuckDB spill directory, kept off the repository")
+	memory := flag.String("memory", "2GB", "DuckDB memory limit")
+	threads := flag.Int("threads", 4, "DuckDB threads")
+	health := flag.Bool("health", false, "ask a running server for /api/health, print it and exit")
 	flag.Parse()
 
 	log.SetPrefix("marketdata: ")
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
+
+	// The deployed image carries no shell tooling, so the container healthcheck
+	// is the binary asking itself.
+	if *health {
+		os.Exit(checkHealth(*addr))
+	}
 
 	if err := os.MkdirAll(*tempDir, 0o755); err != nil {
 		log.Fatalf("create temp dir: %v", err)
@@ -34,7 +46,7 @@ func main() {
 		log.Printf("using proxy %s", proxy.Host)
 	}
 
-	db, err := openDB(*tempDir, proxy)
+	db, err := openDB(dbOptions{tempDir: *tempDir, memory: *memory, threads: *threads, proxy: proxy})
 	if err != nil {
 		log.Fatalf("open duckdb: %v", err)
 	}
@@ -78,4 +90,40 @@ func main() {
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("serve: %v", err)
 	}
+}
+
+// checkHealth asks a running server for /api/health and returns the exit status
+// for the caller. It is what the container healthcheck runs: the deployed image
+// installs no HTTP client of its own.
+func checkHealth(addr string) int {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		log.Printf("health: unusable address %q: %v", addr, err)
+		return 1
+	}
+	switch host {
+	case "", "0.0.0.0", "::":
+		host = "127.0.0.1"
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("http://" + net.JoinHostPort(host, port) + "/api/health")
+	if err != nil {
+		log.Printf("health: %v", err)
+		return 1
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("health: %v", err)
+		return 1
+	}
+	message := strings.TrimSpace(string(body))
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("health: %s: %s", resp.Status, message)
+		return 1
+	}
+	log.Printf("health: %s", message)
+	return 0
 }

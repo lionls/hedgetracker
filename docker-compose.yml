@@ -3,6 +3,11 @@
 #   docker compose up -d --build     # server + worker, built from this repo
 #   open http://localhost:4200       # Prefect UI
 #
+# The market explorer is a separate service in the same file, under its own
+# profile so a bare `up` stays the harness:
+#
+#   docker compose up -d --build explorer   # market explorer on :8080
+#
 # See the "Docker Compose" section of README.md for triggering runs.
 #
 # Everything runs one image built from this repo, so the server, the worker and
@@ -86,7 +91,58 @@ services:
     entrypoint: ["hedgetracker"]
     command: ["run", "--year", "2024", "--quarter", "3", "--limit", "5"]
 
+  # Market explorer: the Go + DuckDB API and the built React frontend in one
+  # image, reading the dataset straight off Hugging Face. It shares nothing with
+  # the harness above — no lake, no Prefect — so it sits behind its own profile
+  # and a bare `up` leaves it alone:
+  #
+  #   docker compose up -d --build explorer   # then http://localhost:8080
+  #
+  # EXPLORER_PORT moves the published port; the container itself always listens
+  # on 8080. The image's own HEALTHCHECK (`marketdata -health`) is inherited.
+  explorer:
+    profiles: ["explorer"]
+    build:
+      context: .
+      dockerfile: Dockerfile.explorer
+    image: hedgetracker-explorer:dev
+    pull_policy: build
+    # Flags, not environment variables: the binary's defaults are the same, and
+    # this is where a server overrides them.
+    command:
+      - "-addr"
+      - ":8080"
+      - "-web"
+      - "/app/web"
+      - "-temp-dir"
+      - "/tmp/marketdata"
+      - "-memory"
+      - "${EXPLORER_MEMORY:-2GB}"
+      - "-threads"
+      - "${EXPLORER_THREADS:-4}"
+    environment:
+      # Empty by default: the dataset is read over HTTPS directly. Set
+      # EXPLORER_HTTPS_PROXY where the server has no direct egress.
+      HTTPS_PROXY: ${EXPLORER_HTTPS_PROXY:-}
+      HTTP_PROXY: ${EXPLORER_HTTPS_PROXY:-}
+      NO_PROXY: ${EXPLORER_NO_PROXY:-}
+    ports:
+      - "${EXPLORER_PORT:-8080}:8080"
+    volumes:
+      # DuckDB's spill directory. None of the dataset is stored: only what a
+      # large sort had to push out of memory.
+      - marketdata-temp:/tmp/marketdata
+    restart: unless-stopped
+    # The server drains in-flight queries on SIGTERM, so give it room to finish.
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   lake:
   edgar-cache:
   prefect-data:
+  marketdata-temp:
