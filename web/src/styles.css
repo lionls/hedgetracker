@@ -348,12 +348,16 @@ body {
   margin: 10px 0 0;
 }
 
-.fundamentals {
+/* A section is a titled block of statements under the headline, and on the 13F
+   dashboard it is a panel: five of them stack in one column, so a section
+   scrolls its own wide table instead of the page scrolling sideways. */
+.section {
   padding: 4px 20px 40px;
   border-top: 1px solid var(--line);
+  overflow-x: auto;
 }
 
-.fundamentals header {
+.section header {
   display: flex;
   flex-wrap: wrap;
   gap: 12px 28px;
@@ -361,7 +365,7 @@ body {
   padding: 16px 0 4px;
 }
 
-.fundamentals h2 {
+.section h2 {
   margin: 0;
   font-size: 15px;
 }
@@ -427,6 +431,100 @@ body {
   font-size: 13px;
 }
 
+/* A ticker cell is the drill-down into that position's price, so it is a button
+   the table's own typography hides. */
+.drill {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.drill:hover {
+  color: #6ab0f3;
+  text-decoration: underline;
+}
+
+/* The issuer is the one column of words in these tables; the figures around it
+   stay right-aligned, and a long issuer name is clipped rather than wrapped. */
+.issuer {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: left;
+}
+
+/* Actions, signal classes and split factors are labels, not figures: a badge
+   keeps them from reading as another numeric column. */
+.badge {
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+.badge.up {
+  border-color: rgba(38, 166, 154, 0.45);
+  background: rgba(38, 166, 154, 0.12);
+  color: var(--up);
+}
+
+.badge.down {
+  border-color: rgba(239, 83, 80, 0.45);
+  background: rgba(239, 83, 80, 0.12);
+  color: var(--down);
+}
+
+.badge.flat {
+  color: var(--muted);
+}
+
+.split {
+  margin-left: 5px;
+}
+
+/* A filter sits at the end of the header of the panel it filters. */
+.filters {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.control {
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #171c24;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+
+.section .more {
+  margin: 12px 0 0;
+}
+
+.section .error {
+  margin: 10px 0 0;
+}
+
+.more:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+.more:disabled:hover {
+  background: transparent;
+}
+
+/* A CIK is ten digits and does not fit the shared 66 px ticker column. */
+.results.funds .result {
+  grid-template-columns: 78px minmax(0, 1fr);
+}
+
 .note {
   max-width: 80ch;
   margin: 14px 0 0;
@@ -461,9 +559,5 @@ body {
   .chart {
     height: 280px;
     min-height: 0;
-  }
-
-  .fundamentals {
-    overflow-x: auto;
   }
 }
