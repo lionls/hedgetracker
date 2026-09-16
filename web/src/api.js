@@ -100,3 +100,60 @@ export function formatChange(change) {
   const sign = change >= 0 ? '+' : '';
   return `${sign}${change.toFixed(2)}`;
 }
+
+// The 13F dashboard. None of it is promise-cached the way bars and profiles
+// are: POST /13f/refresh rewrites these tables in place, so the same query has
+// a different answer afterwards, and every query is a millisecond read of a
+// local Parquet file. A rebuild is also the only thing that makes these
+// requests fail (503 while the tables are unbuilt, building or stale), which is
+// why every caller keeps its own error state instead of a shared cache.
+function query(params) {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    const text = value === null || value === undefined ? '' : String(value).trim();
+    if (text) search.set(key, text);
+  }
+  return search.toString();
+}
+
+// thirteenStatus is the lake's health: state, what it last built, how long it
+// took, and how much is in it.
+export function thirteenStatus() {
+  return getJSON('/13f/status');
+}
+
+export function thirteenFunds(limit = 500) {
+  return getJSON(`/13f/funds?limit=${limit}`);
+}
+
+// thirteenHoldings answers the filer's newest quarter when period is empty, and
+// the response's period is the one it settled on. An unknown filer or a quarter
+// that filer did not file is a 404 with the quarters list in the message.
+export function thirteenHoldings(cik, period, limit = 500) {
+  return getJSON(`/13f/holdings?${query({ cik, period, limit })}`);
+}
+
+// thirteenSignals reads the conviction view: filter by fund, ticker, action,
+// signal class or quarter, all optional. Order is fixed server-side, by the
+// size of the estimated flow.
+export function thirteenSignals(params) {
+  return getJSON(`/13f/signals?${query(params)}`);
+}
+
+export function thirteenVWAP(ticker) {
+  return getJSON(`/13f/vwap?${query({ ticker })}`);
+}
+
+// thirteenRefresh answers 202 when it started a build and 409 when one is
+// already running. Both bodies are the status, and both are states the
+// dashboard renders rather than errors, so neither is thrown: the status it
+// returns is what switches the page into its polling mode.
+export async function thirteenRefresh() {
+  const response = await fetch(`${API}/13f/refresh`, { method: 'POST' });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok && response.status !== 409) {
+    throw new Error(payload.error || `the rebuild request failed with ${response.status}`);
+  }
+  return payload;
+}
+

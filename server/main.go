@@ -26,6 +26,16 @@ func main() {
 	memory := flag.String("memory", "2GB", "DuckDB memory limit")
 	threads := flag.Int("threads", 4, "DuckDB threads")
 	health := flag.Bool("health", false, "ask a running server for /api/health, print it and exit")
+
+	// The 13F dashboard side. The lake is the extractor's output, mounted
+	// read-only; prices come from the same dataset unless they are overridden.
+	lake := flag.String("13f-lake", filepath.Join("data", "lake", "13f_holdings"), "13F holdings lake written by the extractor")
+	cache := flag.String("13f-cache", filepath.Join(*tempDir, "13f-dashboard"), "directory for the materialised 13F tables")
+	prices := flag.String("13f-prices", "", "override the 13F price source (path or URL of a Parquet file); empty uses the dataset")
+	splits := flag.String("13f-splits", "", "override the 13F split-event source (path or URL of a Parquet file); empty uses the dataset")
+	offline := flag.Bool("13f-offline", false, "build the 13F tables without reading prices: signals keep working, estimated flows stay null")
+	maxAge := flag.Duration("13f-max-age", 24*time.Hour, "rebuild the 13F tables when they are older than this; 0 reuses them until the lake changes")
+
 	flag.Parse()
 
 	log.SetPrefix("marketdata: ")
@@ -66,11 +76,26 @@ func main() {
 	// table, so it happens next to the live server rather than in front of it.
 	go dataset.WarmPriced(ctx)
 
+	// The 13F tables are materialised in the background for the same reason: one
+	// conviction query scans the whole price table and the lake at once.
+	priceSource, splitSource := "", ""
+	if !*offline {
+		priceSource, splitSource = dataset.table("stock_prices"), dataset.table("stock_split_events")
+		if *prices != "" {
+			priceSource = sqlString(*prices)
+		}
+		if *splits != "" {
+			splitSource = sqlString(*splits)
+		}
+	}
+	thirteenF := NewThirteenF(db, *lake, *cache, priceSource, splitSource, *maxAge)
+	thirteenF.Warm(ctx)
+
 	if _, err := os.Stat(filepath.Join(*webDir, "index.html")); err != nil {
 		log.Printf("no built frontend in %s (run `npm run build` in web/); serving the API only", *webDir)
 	}
 
-	api := &API{dataset: dataset, webDir: *webDir}
+	api := &API{dataset: dataset, thirteenF: thirteenF, webDir: *webDir}
 	server := &http.Server{
 		Addr:              *addr,
 		Handler:           api.routes(),

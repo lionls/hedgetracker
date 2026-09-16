@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import Chart from './Chart.jsx';
 import Fundamentals from './Fundamentals.jsx';
+import Pages from './Pages.jsx';
 import { companyFor, historyFor, searchSymbols, sliceHistory, stocksList } from './api.js';
 
 const RANGES = ['1y', '5y', 'max'];
@@ -126,14 +127,7 @@ export default function App({ page = 'explorer' }) {
           hedgetracker
           <span>{stocksOnly ? 'stocks' : 'market explorer'}</span>
         </div>
-        <nav className="pages">
-          <a className={stocksOnly ? 'page' : 'page active'} href="/">
-            Explorer
-          </a>
-          <a className={stocksOnly ? 'page active' : 'page'} href="/stocks">
-            Stocks
-          </a>
-        </nav>
+        <Pages page={stocksOnly ? 'stocks' : 'explorer'} />
         <input
           className="search"
           type="search"

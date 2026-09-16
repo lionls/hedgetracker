@@ -1,16 +1,15 @@
 import { useEffect, useMemo, useState } from 'react';
 import { fundamentalsFor } from './api.js';
+import { compact, count, dollars, percent } from './numbers.js';
 
-// Statements are quoted in whole units of the listing currency and the
-// magnitudes are what matter, so $47.94B is more readable than 47941000000.
-const money = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 2 });
-const plain = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 });
-
+// Statements are quoted in whole units of the listing currency, so the compact
+// form the dashboard uses is the right one here too: $47.94B reads better than
+// 47941000000.
 function formatValue(value, unit) {
   if (value === null || value === undefined) return '—';
-  if (unit === 'perShare') return plain.format(value);
-  if (unit === 'percent') return `${plain.format(value)}%`;
-  return `$${money.format(value)}`;
+  if (unit === 'perShare') return count(value);
+  if (unit === 'percent') return percent(value);
+  return dollars(value);
 }
 
 // ratios adds the two figures the statements imply but do not state: how much
@@ -63,7 +62,7 @@ export default function Fundamentals({ symbol }) {
 
   if (fundamentals === undefined) {
     return (
-      <section className="fundamentals">
+      <section className="section">
         <h2>Fundamentals</h2>
         <p className="muted">loading statements…</p>
       </section>
@@ -71,7 +70,7 @@ export default function Fundamentals({ symbol }) {
   }
   if (fundamentals === null) {
     return (
-      <section className="fundamentals">
+      <section className="section">
         <h2>Fundamentals</h2>
         <p className="muted">The dataset holds no financial statements for {symbol}.</p>
       </section>
@@ -84,14 +83,14 @@ export default function Fundamentals({ symbol }) {
   // the chart's bars and cannot show the previous symbol's price.
   const close = fundamentals.close || 0;
   const figures = [
-    ['Market cap', shares && close ? `$${money.format(shares * close)}` : '—'],
-    ['Shares outstanding', shares ? money.format(shares) : '—'],
-    ['Trailing EPS', trailing ? plain.format(trailing) : '—'],
-    ['P/E', trailing > 0 && close ? plain.format(close / trailing) : '—'],
+    ['Market cap', shares && close ? dollars(shares * close) : '—'],
+    ['Shares outstanding', shares ? compact(shares) : '—'],
+    ['Trailing EPS', trailing ? count(trailing) : '—'],
+    ['P/E', trailing > 0 && close ? count(close / trailing) : '—'],
   ];
 
   return (
-    <section className="fundamentals">
+    <section className="section">
       <header>
         <h2>Fundamentals</h2>
         <dl className="figures">
