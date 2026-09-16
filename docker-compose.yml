@@ -92,9 +92,9 @@ services:
     command: ["run", "--year", "2024", "--quarter", "3", "--limit", "5"]
 
   # Market explorer: the Go + DuckDB API and the built React frontend in one
-  # image, reading the dataset straight off Hugging Face. It shares nothing with
-  # the harness above — no lake, no Prefect — so it sits behind its own profile
-  # and a bare `up` leaves it alone:
+  # image, reading the dataset straight off Hugging Face and the harness's lake
+  # (read-only) for the 13F dashboard. No Prefect, so it sits behind its own
+  # profile and a bare `up` leaves it alone:
   #
   #   docker compose up -d --build explorer   # then http://localhost:8080
   #
@@ -120,6 +120,12 @@ services:
       - "${EXPLORER_MEMORY:-2GB}"
       - "-threads"
       - "${EXPLORER_THREADS:-4}"
+      # The 13F dashboard reads the lake the pipelines write, mounted read-only.
+      # Without it the explorer still serves prices and reports `unconfigured`.
+      - "-13f-lake"
+      - "/data/lake/13f_holdings"
+      - "-13f-max-age"
+      - "${EXPLORER_13F_MAX_AGE:-24h}"
     environment:
       # Empty by default: the dataset is read over HTTPS directly. Set
       # EXPLORER_HTTPS_PROXY where the server has no direct egress.
@@ -130,8 +136,12 @@ services:
       - "${EXPLORER_PORT:-8080}:8080"
     volumes:
       # DuckDB's spill directory. None of the dataset is stored: only what a
-      # large sort had to push out of memory.
+      # large sort had to push out of memory. The materialised 13F tables live
+      # here too (default: -13f-cache = <temp-dir>/13f-dashboard).
       - marketdata-temp:/tmp/marketdata
+      # The harness's lake, read-only: the 13F dashboard reads the holdings the
+      # worker wrote and never writes to them.
+      - lake:/data/lake:ro
     restart: unless-stopped
     # The server drains in-flight queries on SIGTERM, so give it room to finish.
     stop_grace_period: 30s

@@ -404,6 +404,89 @@ makes the JSON — and its gzip — roughly three times smaller, and every `/api
 response is gzipped. Price columns are `DECIMAL(16,4)` in the file and cast to
 `DOUBLE` in SQL, volume to `BIGINT`.
 
+### 13F dashboard endpoints
+
+The explorer serves the other half of the dataset: the 13F holdings lake the
+extractor writes — the one table it reads from disk instead of the Hub — joined to
+the same dataset's prices and split events and folded into the four views
+`server/thirteenf.sql` defines. The lake says what funds held; the dataset supplies
+the quarterly VWAP that turns a share change into an estimated capital flow.
+
+| View | What it is |
+| --- | --- |
+| `holdings_normalized` | one row per (filer, report period, CUSIP): shares, value, portfolio weight, and how many filing lines it was collapsed from |
+| `market_quarterly_vwap` | per ticker and quarter: trading days, first and last trade date, volume-weighted close, low and high |
+| `fund_quarterly_flows` | one row per position a fund changed between consecutive *filings*, with split-adjusted deltas and an action — NEW, ADDED, TRIMMED, EXITED or HELD |
+| `conviction_scores` | the flows joined to the VWAP: `estCapitalFlow`, and a signal — HIGH_CONVICTION_BUY, STANDARD_BUY, PASSIVE_REBALANCE, CONVICTION_DUMP, MAINTAINED or ROUTINE_ADJUSTMENT |
+
+Three properties of the serving path matter to a client:
+
+* **The tables are materialised, not queried live.** One conviction query reads the
+  whole lake and the whole price table, which is minutes of work no dashboard
+  request can wait for. The server builds the four tables in the background at
+  startup, reports that build on `/api/13f/status`, keeps serving the previous build
+  while a new one runs, and answers every data endpoint `503` — with the status in
+  the body — until the first build is ready. `POST /api/13f/refresh` starts one by
+  hand and answers `202`, or `409` while a build is already running.
+* **Rows are objects here, not column arrays.** A fund-quarter is hundreds of rows
+  and a dashboard wants named fields, so the 13F endpoints return one object per
+  row; `/api/bars` keeps its array-per-field shape because it carries thousands of
+  bars.
+* **The cache survives a redeploy.** The tables and a manifest live under
+  `-13f-cache`, and a manifest whose recorded view hash does not match the running
+  binary is rebuilt whatever `-13f-max-age` says. Until that rebuild succeeds the
+  server reports `stale` and answers every data endpoint `503` rather than serving
+  tables another version of the views built; a rebuild that fails over a cache of
+  the *same* views leaves the previous tables serving, with the reason in
+  `lastError`.
+
+| Route | Answer |
+| --- | --- |
+| `GET /api/13f/status` | `{"state":"ready","builtAt":"2026-09-16T20:06:09Z","buildSeconds":212.7,"lakeFiles":25,"filings":25,"funds":9,"positions":2422,"flows":1153,"signals":1153,"quarters":["2021-12-31",…,"2024-06-30"]}`; `state` is `ready`, `building`, `stale`, `failed` or `unconfigured`, `lastError` carries the last failed build, and `/api/health` carries `thirteenF` |
+| `GET /api/13f/funds` | `{"funds":[{"cik":"0000891943","quarters":1,"firstPeriod":"2024-06-30","latestPeriod":"2024-06-30","latestValueUsd":1501802000,"latestPositions":794},…],"total":9,"limit":500}` — one row per filer, its newest portfolio, largest first |
+| `GET /api/13f/holdings?cik=2038506&period=2024Q2` | `{"cik":"0002038506","period":"2024-06-30","quarters":[…11 periods…],"portfolioValueUsd":131104358,"total":67,"holdings":[{"cusip":"464288679","ticker":"SHV","issuer":"ISHARES TR","classTitle":"SHORT TREAS BD","shares":127843,"valueUsd":14126679,"weightPct":10.7751,"reportedLines":1},…]}`; `period` takes a date, a quarter label or `latest`, and defaults to the filer's newest filing; the weights of a fund-quarter sum to 100% |
+| `GET /api/13f/flows?cik=2038506&action=NEW,ADDED` | `{"cik":"0002038506","period":"","actions":[…],"total":389,"flows":[{"cik":"0002038506","period":"2024-06-30","prevPeriod":"2024-03-31","quartersBetween":1,"cusip":"595112103","ticker":"MU","issuer":"MICRON TECHNOLOGY INC","action":"NEW","shares":17554,"valueUsd":2308878,"weightPct":1.7611,"prevShares":0,"deltaShares":17554,"deltaSharesPct":null,"deltaWeightPct":1.7611,"splitFactor":1,"splitAdjusted":false},…]}`; without `period` it reports the fund's whole history, newest first |
+| `GET /api/13f/signals?period=2024Q2&signal=HIGH_CONVICTION_BUY` | the flow shape plus `signal`, `quarterlyVwap`, `quarterlyLow`, `quarterlyHigh`, `estCapitalFlow`. The filters are `cik`, `ticker`, `period`, `action` and `signal`, and `period=latest` is the default; with no filters it answers the lake's newest quarter, largest estimated flow first, and for one fund and ticker it is the position: `?cik=2038506&period=2024Q2&ticker=NVDA` is `{"action":"TRIMMED","shares":20139,"prevShares":21720,"deltaShares":-1581,"splitFactor":10,"splitAdjusted":true,"weightPct":1.8977,"signal":"PASSIVE_REBALANCE","quarterlyVwap":100.3169,"estCapitalFlow":-158601}` |
+| `GET /api/13f/vwap?ticker=NVDA` | `{"ticker":"NVDA","quarters":[{"symbol":"NVDA","year":2024,"quarter":2,"tradingDays":63,"firstTradeDate":"2024-04-01","lastTradeDate":"2024-06-28","totalVolume":27164691100,"vwap":100.3169,"low":75.606,"high":140.76},…]}` |
+| `POST /api/13f/refresh` | `202` with the status body, or `409` with it while a build is running |
+| `GET /*` | `web/dist`, falling back to `index.html` |
+
+The panels are these six calls and no more: a fund picker is `/funds`; a holdings
+table is `/holdings?cik=…` with its quarter selector filled from `quarters`; a
+"what changed" chart is `/flows?cik=…`, filtered by `action`; the dashboard's
+opening view — what conviction moved this quarter — is `/signals?period=…`; the
+drill-down from a signal row is `/signals?cik=…&ticker=…`, with the price context
+beside it from `/vwap?ticker=…`; and the refresh button is `POST /refresh`.
+
+Five things the numbers mean, which the SQL file argues in full:
+
+* **A position is a CUSIP, and a filing can repeat one.** 184 (filer, period, CUSIP)
+  groups in this lake carry more than one line item — up to five — and the views
+  sum them into one position, so 3,069 filing lines become 2,422 positions.
+  Without that collapse, joining a position to its previous quarter would inflate
+  every weight and delta by the same factor.
+* **Share deltas are split-adjusted, values are not** — a split does not change
+  market value — and `splitFactor` says what was applied. Over 2024Q1→Q2, CIK
+  0002038506's NVDA position reads as a 17,967-share increase from the raw filings
+  and as a 1,581-share trim once the 10:1 split of 2024-06-10 is undone; CIK
+  0002032121's reads as +13,395 before and +3,603 after. `splitAdjusted: false`
+  also covers "this lake has no split data", which is why the factor is exposed
+  next to it.
+* **Flows compare a fund's consecutive filings, not consecutive quarters.**
+  `quartersBetween` is 1 in the clean case; a fund that files sparsely gets its
+  deltas across the gap, and a position missing from the earlier filing is NEW
+  rather than ADDED.
+* **The VWAP is a daily-close proxy**, `SUM(close*volume)/SUM(volume)` over the
+  quarter's bars — the dataset ships `close` and `volume` and no intraday prices.
+  `estCapitalFlow` is the split-adjusted share delta times it, so it is `null` for
+  the third of positions whose ticker has no bars.
+* **The lake carries no filer name**, only the CIK and the issuer fields, so the
+  fund picker shows CIKs. A `filerName` column in the extractor's schema is the fix.
+
+`-13f-offline` builds the tables from the lake alone: the flows, the actions and
+the signals are unchanged, `estCapitalFlow` and the VWAP columns are `null`, and a
+build takes a quarter of a second instead of three and a half minutes.
+
 ### The stocks page
 
 `/stocks` is the same app in a second mode: same chart, same company card, same
@@ -512,6 +595,15 @@ docker compose --profile explorer down   # stops and removes the container, keep
 | `EXPLORER_THREADS` | `4` | DuckDB threads |
 | `EXPLORER_HTTPS_PROXY` | empty | Sets `HTTPS_PROXY` in the container, for a host that reaches the Hub only through a proxy |
 | `EXPLORER_NO_PROXY` | empty | Hosts to skip for that proxy |
+| `EXPLORER_13F_MAX_AGE` | `24h` | Rebuild the materialised 13F tables when they are older than this; `0` reuses them until the mounted lake changes |
+
+The explorer also carries the 13F dashboard's flags — `-13f-lake` (the mounted
+holdings lake, `/data/lake/13f_holdings`), `-13f-cache` (where the materialised
+tables go, `/tmp/marketdata/13f-dashboard` by default), `-13f-prices`/`-13f-splits`
+(override the price or split source with a path or URL) and `-13f-offline` (build
+without prices at all). `-13f-max-age 0` means "reuse the tables until the lake
+changes", which is what a redeploy wants: the price scan behind a build is minutes,
+so it should not be repeated for an unchanged lake.
 
 Debian, not Alpine, because `go-duckdb` links DuckDB's C++ static library against
 glibc. Besides that library and `ca-certificates` — the two things `ldd

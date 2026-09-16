@@ -14,8 +14,9 @@ import (
 
 // API serves the JSON endpoints and the built frontend.
 type API struct {
-	dataset *Dataset
-	webDir  string
+	dataset   *Dataset
+	thirteenF *ThirteenF
+	webDir    string
 }
 
 // routes wires the endpoints. API responses are compressed; the frontend is
@@ -28,6 +29,13 @@ func (a *API) routes() http.Handler {
 	api.HandleFunc("GET /api/company/{symbol}", a.company)
 	api.HandleFunc("GET /api/bars/{symbol}", a.bars)
 	api.HandleFunc("GET /api/fundamentals/{symbol}", a.fundamentals)
+	api.HandleFunc("GET /api/13f/status", a.thirteenfStatus)
+	api.HandleFunc("GET /api/13f/funds", a.thirteenfFunds)
+	api.HandleFunc("GET /api/13f/holdings", a.thirteenfHoldings)
+	api.HandleFunc("GET /api/13f/flows", a.thirteenfFlows)
+	api.HandleFunc("GET /api/13f/signals", a.thirteenfSignals)
+	api.HandleFunc("GET /api/13f/vwap", a.thirteenfVWAP)
+	api.HandleFunc("POST /api/13f/refresh", a.thirteenfRefresh)
 
 	root := http.NewServeMux()
 	root.Handle("/api/", gzipHandler(api))
@@ -39,12 +47,17 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 	a.dataset.mu.RLock()
 	indexed, priced := len(a.dataset.index), len(a.dataset.priced)
 	a.dataset.mu.RUnlock()
+	// The 13F state is reported but never fails the check: the explorer serves
+	// prices and company data without a holdings lake.
+	thirteen := a.thirteenF.Status()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":     "ok",
-		"tables":     a.dataset.Prefix(),
-		"symbols":    indexed,
-		"priced":     priced,
-		"pricedDone": priced > 0,
+		"status":           "ok",
+		"tables":           a.dataset.Prefix(),
+		"symbols":          indexed,
+		"priced":           priced,
+		"pricedDone":       priced > 0,
+		"thirteenF":        thirteen.State,
+		"thirteenFBuiltAt": thirteen.BuiltAt,
 	})
 }
 
