@@ -426,8 +426,15 @@ Three properties of the serving path matter to a client:
   request can wait for. The server builds the four tables in the background at
   startup, reports that build on `/api/13f/status`, keeps serving the previous build
   while a new one runs, and answers every data endpoint `503` — with the status in
-  the body — until the first build is ready. `POST /api/13f/refresh` starts one by
-  hand and answers `202`, or `409` while a build is already running.
+  body — until the first build is ready. `POST /api/13f/refresh` starts one by
+  hand and answers `202`, or `409` while a build is already running. Each table is
+  written to Parquet before the next one is built and read back from that file, so a
+  later view streams a stage instead of re-deriving the whole lake, and the
+  portfolio weight is a grouped total joined back rather than a window DuckDB
+  cannot spill: 3.9M positions build under `-memory 1GB` with about 100 MB of spill,
+  and a 486k-position lake builds under `-memory 256MB` where the window form ran
+  out of memory. The raw `positions` stage lands in the cache as well, but nothing
+  serves it.
 * **Rows are objects here, not column arrays.** A fund-quarter is hundreds of rows
   and a dashboard wants named fields, so the 13F endpoints return one object per
   row; `/api/bars` keeps its array-per-field shape because it carries thousands of
@@ -591,7 +598,7 @@ docker compose --profile explorer down   # stops and removes the container, keep
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `EXPLORER_PORT` | `8080` | Published host port; the container always listens on `8080` |
-| `EXPLORER_MEMORY` | `2GB` | DuckDB's memory limit; the boot scan is the one query that wants more |
+| `EXPLORER_MEMORY` | `2GB` | DuckDB's memory limit; the priced boot scan and the 13F build are the queries that want more — the 13F build of 3.9M positions fits in `1GB` |
 | `EXPLORER_THREADS` | `4` | DuckDB threads |
 | `EXPLORER_HTTPS_PROXY` | empty | Sets `HTTPS_PROXY` in the container, for a host that reaches the Hub only through a proxy |
 | `EXPLORER_NO_PROXY` | empty | Hosts to skip for that proxy |
