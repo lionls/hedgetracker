@@ -69,6 +69,13 @@
 -- in the reference lake. sshPrnamtType is 'Shares' throughout, so no filtering
 -- on it is needed; principal-amount rows would be summed alongside shares
 -- otherwise.
+--
+-- 8. Portfolio totals are a grouped aggregate joined back onto the positions,
+--    not SUM(value_usd) OVER (PARTITION BY cik, report_period). A window keeps
+--    its partitions in memory for the whole scan and cannot spill, so
+--    materialising holdings_normalized over a real lake (4.9M raw rows, 40k
+--    filings) dies on the memory limit; the grouped form spills and its build
+--    side is one row per filing.
 
 CREATE OR REPLACE VIEW positions AS
 WITH reported AS (
@@ -94,29 +101,43 @@ SELECT
   arg_max(nameOfIssuer, value)                         AS issuer,
   arg_max(titleOfClass, value)                         AS class_title,
   COALESCE(NULLIF(arg_max(ticker, value), ''), cusip)  AS ticker,
-  SUM(sshPrnamt)                                       AS shares,
-  SUM(value)                                           AS value_usd,
+  -- Sums are cast to DOUBLE so the materialised Parquet keeps the type: an
+  -- integer SUM is a HUGEINT, which Parquet has no column type for, and the
+  -- stages below read this table back from Parquet with a view that would no
+  -- longer match its own definition.
+  CAST(SUM(sshPrnamt) AS DOUBLE)                       AS shares,
+  CAST(SUM(value) AS DOUBLE)                           AS value_usd,
   count(*)                                             AS reported_lines
 FROM reported
 GROUP BY cik, report_period, cusip;
 
 CREATE OR REPLACE VIEW holdings_normalized AS
+WITH portfolio_totals AS (
+  SELECT
+    cik,
+    report_period,
+    SUM(value_usd) AS portfolio_value_total
+  FROM positions
+  GROUP BY cik, report_period
+)
 SELECT
-  cik,
-  report_period,
-  year(report_period)    AS report_year,
-  quarter(report_period) AS report_quarter,
-  cusip,
-  issuer,
-  class_title,
-  ticker,
-  shares,
-  value_usd,
-  reported_lines,
-  SUM(value_usd) OVER w                                          AS portfolio_value_total,
-  ROUND(100.0 * value_usd / NULLIF(SUM(value_usd) OVER w, 0), 4) AS portfolio_weight_pct
-FROM positions
-WINDOW w AS (PARTITION BY cik, report_period);
+  p.cik,
+  p.report_period,
+  year(p.report_period)    AS report_year,
+  quarter(p.report_period) AS report_quarter,
+  p.cusip,
+  p.issuer,
+  p.class_title,
+  p.ticker,
+  p.shares,
+  p.value_usd,
+  p.reported_lines,
+  t.portfolio_value_total,
+  ROUND(100.0 * p.value_usd / NULLIF(t.portfolio_value_total, 0), 4) AS portfolio_weight_pct
+FROM positions p
+JOIN portfolio_totals t
+  ON  t.cik = p.cik
+  AND t.report_period = p.report_period;
 
 CREATE OR REPLACE VIEW market_quarterly_vwap AS
 SELECT
@@ -126,7 +147,7 @@ SELECT
   count(*)                           AS trading_days,
   MIN(CAST(report_date AS DATE))     AS first_trade_date,
   MAX(CAST(report_date AS DATE))     AS last_trade_date,
-  SUM(volume)                        AS total_volume,
+  CAST(SUM(volume) AS DOUBLE)        AS total_volume,
   ROUND(SUM(close * volume) / NULLIF(SUM(volume), 0), 4) AS quarterly_vwap,
   MIN(low)                           AS quarterly_low,
   MAX(high)                          AS quarterly_high

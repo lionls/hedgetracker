@@ -50,6 +50,7 @@ func thirteenViewsHash() string {
 
 // Names of the materialised tables and of the manifest that points at them.
 const (
+	thirteenPositions  = "positions"
 	thirteenHoldings   = "holdings_normalized"
 	thirteenVWAP       = "market_quarterly_vwap"
 	thirteenFlows      = "fund_quarterly_flows"
@@ -58,8 +59,11 @@ const (
 	thirteenTablesDir  = "tables"
 )
 
-// thirteenTables is what a build must produce, in dependency order.
-var thirteenTables = []string{thirteenHoldings, thirteenVWAP, thirteenFlows, thirteenConviction}
+// thirteenTables is what a build must produce, in dependency order. positions
+// is not served to the dashboard: it is the collapse of the lake's reporting
+// lines to one row per filer, period and CUSIP, and materialising it first is
+// what keeps every later stage off the raw lake.
+var thirteenTables = []string{thirteenPositions, thirteenHoldings, thirteenVWAP, thirteenFlows, thirteenConviction}
 
 // thirteenActions are the position changes the flows view reports.
 var thirteenActions = []string{"NEW", "ADDED", "TRIMMED", "EXITED", "HELD"}
@@ -297,10 +301,21 @@ func (t *ThirteenF) materialise(ctx context.Context) (*manifest, error) {
 	}
 
 	for _, table := range thirteenTables {
-		query := fmt.Sprintf("COPY (SELECT * FROM %s) TO %s (FORMAT PARQUET)",
-			table, sqlString(filepath.Join(target, table+".parquet")))
+		path := filepath.Join(target, table+".parquet")
+		query := fmt.Sprintf("COPY (SELECT * FROM %s) TO %s (FORMAT PARQUET)", table, sqlString(path))
 		if _, err := conn.ExecContext(ctx, query); err != nil {
 			return nil, fmt.Errorf("materialise %s: %w", table, err)
+		}
+
+		// The views below read this table, so point it at what was just
+		// written instead of leaving them to re-derive it. Re-deriving means
+		// re-scanning every lake partition and re-running the aggregate once
+		// per dependent view, which is what made a real lake exceed its memory
+		// limit; the Parquet read streams instead.
+		point := fmt.Sprintf("CREATE OR REPLACE VIEW %s AS SELECT * FROM read_parquet(%s)",
+			table, sqlString(filepath.ToSlash(path)))
+		if _, err := conn.ExecContext(ctx, point); err != nil {
+			return nil, fmt.Errorf("read back %s: %w", table, err)
 		}
 	}
 
