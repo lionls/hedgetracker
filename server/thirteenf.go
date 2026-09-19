@@ -50,20 +50,46 @@ func thirteenViewsHash() string {
 
 // Names of the materialised tables and of the manifest that points at them.
 const (
-	thirteenPositions  = "positions"
-	thirteenHoldings   = "holdings_normalized"
-	thirteenVWAP       = "market_quarterly_vwap"
-	thirteenFlows      = "fund_quarterly_flows"
-	thirteenConviction = "conviction_scores"
-	thirteenManifest   = "manifest.json"
-	thirteenTablesDir  = "tables"
+	// positions_base is the fixed-width half of the positions stage: the lake's
+	// reporting lines collapsed to one row per filer, period and CUSIP, with
+	// the issuer, class and ticker names joined in by the positions view. Both
+	// halves are built one lake partition at a time.
+	thirteenPositionsBase = "positions_base"
+	thirteenPositions     = "positions"
+	thirteenHoldings      = "holdings_normalized"
+	thirteenVWAP          = "market_quarterly_vwap"
+	thirteenFlows         = "fund_quarterly_flows"
+	thirteenConviction    = "conviction_scores"
+	thirteenManifest      = "manifest.json"
+	thirteenTablesDir     = "tables"
 )
 
 // thirteenTables is what a build must produce, in dependency order. positions
 // is not served to the dashboard: it is the collapse of the lake's reporting
-// lines to one row per filer, period and CUSIP, and materialising it first is
-// what keeps every later stage off the raw lake.
-var thirteenTables = []string{thirteenPositions, thirteenHoldings, thirteenVWAP, thirteenFlows, thirteenConviction}
+// lines to one row per filer, period and CUSIP plus the security's names, and
+// materialising it first is what keeps every later stage off the raw lake.
+var thirteenTables = []string{
+	thirteenPositionsBase, thirteenPositions,
+	thirteenHoldings, thirteenVWAP, thirteenFlows, thirteenConviction,
+}
+
+// thirteenChunked are the tables that must not read the whole lake in one
+// statement. The DuckDB the driver bundles has no out-of-core hash
+// aggregation, so a grouped aggregate dies as soon as its state outgrows the
+// memory limit, and both of these group by filer, period and CUSIP, or join
+// those rows to a per-CUSIP name collapse. That state grows with the lake:
+// measured on a 484k-position lake the collapse fails at 61MiB of a 64MB limit
+// even with fixed-width payloads, and on a 2.8M-position lake with real CUSIP
+// cardinality the name collapse alone exhausts a 256MB limit.
+//
+// No such group spans a period and the lake is partitioned by period, so
+// building these tables one lake partition at a time bounds their state at one
+// quarter instead of the whole lake. The stages above them read them back from
+// Parquet and group by fund and period, which is a bounded number of groups.
+var thirteenChunked = map[string]bool{
+	thirteenPositionsBase: true,
+	thirteenPositions:     true,
+}
 
 // thirteenActions are the position changes the flows view reports.
 var thirteenActions = []string{"NEW", "ADDED", "TRIMMED", "EXITED", "HELD"}
@@ -210,7 +236,12 @@ func (t *ThirteenF) fresh() bool {
 		return false
 	}
 	for _, table := range thirteenTables {
-		if _, err := os.Stat(t.path(stored, table)); err != nil {
+		path := t.path(stored, table)
+		if thirteenChunked[table] {
+			// A chunked table is a directory of one file per lake partition.
+			path = filepath.Join(t.cacheDir, stored.Dir, table)
+		}
+		if _, err := os.Stat(path); err != nil {
 			return false
 		}
 	}
@@ -302,9 +333,17 @@ func (t *ThirteenF) materialise(ctx context.Context) (*manifest, error) {
 
 	for _, table := range thirteenTables {
 		path := filepath.Join(target, table+".parquet")
-		query := fmt.Sprintf("COPY (SELECT * FROM %s) TO %s (FORMAT PARQUET)", table, sqlString(path))
-		if _, err := conn.ExecContext(ctx, query); err != nil {
-			return nil, fmt.Errorf("materialise %s: %w", table, err)
+		if thirteenChunked[table] {
+			// One file per lake partition instead of one for the whole lake.
+			path = filepath.Join(target, table, "*.parquet")
+			if err := t.materialisePartitions(ctx, conn, target, table); err != nil {
+				return nil, err
+			}
+		} else {
+			query := fmt.Sprintf("COPY (SELECT * FROM %s) TO %s (FORMAT PARQUET)", table, sqlString(path))
+			if _, err := conn.ExecContext(ctx, query); err != nil {
+				return nil, fmt.Errorf("materialise %s: %w", table, err)
+			}
 		}
 
 		// The views below read this table, so point it at what was just
@@ -349,6 +388,79 @@ func (t *ThirteenF) materialise(ctx context.Context) (*manifest, error) {
 
 	t.prune(dir)
 	return stored, nil
+}
+
+// materialisePartitions writes one Parquet file per lake partition. A chunked
+// table collapses filer, period and CUSIP rows or joins them to the security
+// names, and no such row spans a period, so running the statement once per
+// partition bounds its state by that partition's rows. What it reads is pointed
+// at that partition for the duration of its COPY: raw_holdings is the lake
+// itself, and every chunked table built before it is its own file for that
+// partition. The names are therefore collapsed per partition, so a CUSIP whose
+// filers spell it differently can be named from a different spelling in each
+// period.
+func (t *ThirteenF) materialisePartitions(ctx context.Context, conn *sql.Conn, target, table string) error {
+	partitions, err := filepath.Glob(filepath.Join(t.lakeDir, "*", "*"))
+	if err != nil {
+		return fmt.Errorf("list lake partitions: %w", err)
+	}
+	if len(partitions) == 0 {
+		return fmt.Errorf("no lake partitions under %s", t.lakeDir)
+	}
+	dir := filepath.Join(target, table)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", dir, err)
+	}
+
+	namer := strings.NewReplacer("year=", "", "quarter=", "", string(os.PathSeparator), "-")
+	for _, partition := range partitions {
+		rel, err := filepath.Rel(t.lakeDir, partition)
+		if err != nil {
+			return fmt.Errorf("name lake partition %s: %w", partition, err)
+		}
+		name := namer.Replace(rel)
+
+		type source struct{ view, path string }
+		sources := []source{{"raw_holdings", filepath.Join(partition, "*.parquet")}}
+		for _, built := range thirteenTables {
+			if built == table {
+				break
+			}
+			if thirteenChunked[built] {
+				sources = append(sources, source{built, filepath.Join(target, built, name+".parquet")})
+			}
+		}
+		for _, read := range sources {
+			view := fmt.Sprintf("CREATE OR REPLACE VIEW %s AS SELECT * FROM read_parquet(%s)",
+				read.view, sqlString(filepath.ToSlash(read.path)))
+			if _, err := conn.ExecContext(ctx, view); err != nil {
+				return fmt.Errorf("read %s for partition %s: %w", read.view, rel, err)
+			}
+		}
+
+		out := filepath.Join(dir, name+".parquet")
+		query := fmt.Sprintf("COPY (SELECT * FROM %s) TO %s (FORMAT PARQUET)", table, sqlString(out))
+		if _, err := conn.ExecContext(ctx, query); err != nil {
+			return fmt.Errorf("materialise %s for %s: %w", table, rel, err)
+		}
+	}
+
+	// Every later stage reads the whole lake, so put the sources back.
+	for _, built := range thirteenTables {
+		if !thirteenChunked[built] {
+			continue
+		}
+		builtDir := filepath.Join(target, built)
+		if _, err := os.Stat(builtDir); err != nil {
+			continue
+		}
+		view := fmt.Sprintf("CREATE OR REPLACE VIEW %s AS SELECT * FROM read_parquet(%s)",
+			built, sqlString(filepath.ToSlash(filepath.Join(builtDir, "*.parquet"))))
+		if _, err := conn.ExecContext(ctx, view); err != nil {
+			return fmt.Errorf("read back %s: %w", built, err)
+		}
+	}
+	return t.createRawViews(ctx, conn)
 }
 
 // count fills in what the build produced, for the manifest and the status
