@@ -76,8 +76,28 @@
 --    materialising holdings_normalized over a real lake (4.9M raw rows, 40k
 --    filings) dies on the memory limit; the grouped form spills and its build
 --    side is one row per filing.
+--
+-- 9. The positions stage is split in two: positions_base collapses the lake's
+--    reporting lines to one row per filer, period and CUSIP with sums and a
+--    count, and positions joins the security's names onto it. The names are
+--    arg_max over a VARCHAR - variable-length aggregate state, which DuckDB
+--    holds in a string heap that cannot spill - so carrying them through the
+--    collapse is what ran the memory limit out once the lake was large enough:
+--    on the same 484k-position lake at a 64MB limit the string form dies while
+--    the identical GROUP BY with fixed-width payloads completes. Collapsed per
+--    CUSIP the names cost one row per security instead of one per position, and
+--    positions_base is materialised on its own stage so the join that adds them
+--    reads two Parquet relations instead of sharing a pipeline with the
+--    aggregate. The names are then read off the CUSIP rather than off the
+--    reporting filer; measured on the reference lake (3,069 raw rows) both
+--    forms agree on every position, and the ticker is the bundled CUSIP map
+--    either way.
 
-CREATE OR REPLACE VIEW positions AS
+-- The collapse of the lake's reporting lines to one row per filer, period and
+-- CUSIP. Its aggregate state is fixed width - two sums and a count - which is
+-- what lets DuckDB spill it; the security's names are added in positions below,
+-- because a variable-length aggregate state is not spillable.
+CREATE OR REPLACE VIEW positions_base AS
 WITH reported AS (
   -- report_period is normalised before it is grouped on: the lake stores it as
   -- text, and grouping on the raw column would split a filing in two if the
@@ -86,9 +106,6 @@ WITH reported AS (
     cik,
     CAST(report_period AS DATE) AS report_period,
     cusip,
-    nameOfIssuer,
-    titleOfClass,
-    ticker,
     sshPrnamt,
     value
   FROM raw_holdings
@@ -98,18 +115,41 @@ SELECT
   cik,
   report_period,
   cusip,
-  arg_max(nameOfIssuer, value)                         AS issuer,
-  arg_max(titleOfClass, value)                         AS class_title,
-  COALESCE(NULLIF(arg_max(ticker, value), ''), cusip)  AS ticker,
   -- Sums are cast to DOUBLE so the materialised Parquet keeps the type: an
   -- integer SUM is a HUGEINT, which Parquet has no column type for, and the
   -- stages below read this table back from Parquet with a view that would no
   -- longer match its own definition.
-  CAST(SUM(sshPrnamt) AS DOUBLE)                       AS shares,
-  CAST(SUM(value) AS DOUBLE)                           AS value_usd,
-  count(*)                                             AS reported_lines
+  CAST(SUM(sshPrnamt) AS DOUBLE) AS shares,
+  CAST(SUM(value) AS DOUBLE)     AS value_usd,
+  count(*)                       AS reported_lines
 FROM reported
 GROUP BY cik, report_period, cusip;
+
+CREATE OR REPLACE VIEW security_names AS
+SELECT
+  cusip,
+  arg_max(nameOfIssuer, value)                         AS issuer,
+  arg_max(titleOfClass, value)                         AS class_title,
+  COALESCE(NULLIF(arg_max(ticker, value), ''), cusip)  AS ticker
+FROM raw_holdings
+WHERE putCall IS NULL
+GROUP BY cusip;
+
+CREATE OR REPLACE VIEW positions AS
+-- Every CUSIP of the lake is in security_names, because both sides read the
+-- same raw rows through the same option filter.
+SELECT
+  c.cik,
+  c.report_period,
+  c.cusip,
+  n.issuer,
+  n.class_title,
+  n.ticker,
+  c.shares,
+  c.value_usd,
+  c.reported_lines
+FROM positions_base c
+JOIN security_names n ON n.cusip = c.cusip;
 
 CREATE OR REPLACE VIEW holdings_normalized AS
 WITH portfolio_totals AS (
