@@ -1,7 +1,9 @@
 """Prefect extraction of quarterly SEC 13F-HR holdings into a Parquet data lake.
 
 ``extract_13f_holdings`` extracts a single filing; ``extract_quarterly_13f``
-fans the task out across one EDGAR quarterly index window.
+fans the task out across one EDGAR quarterly index window; ``backfill_13f``
+sweeps every closed window; ``compact_13f`` merges an extracted quarter's
+per-filer files into one file per partition.
 """
 
 from __future__ import annotations
@@ -83,11 +85,13 @@ def extract_13f_holdings(filing: Filing, base_dir: str) -> dict[str, Any] | None
     # An already-extracted filing is recognised from its index page, which is a
     # fraction of the submission the full extraction downloads, so re-running a
     # quarter costs one small request per filer instead of a submission download
-    # and an information-table parse each.
+    # and an information-table parse each. The lake may hold the filer as its own
+    # file or, once the quarter has been compacted, inside the partition's merged
+    # file; storage answers for both.
     if (indexed_period := data.report_period_from_index_page(filing)) is not None:
         year, quarter = storage.year_quarter(indexed_period)
-        extracted = storage.holdings_path(base_dir, year, quarter, filing.cik)
-        if extracted.exists():
+        extracted = storage.extracted_path(base_dir, year, quarter, filing.cik)
+        if extracted is not None:
             logger.info(
                 "Skipping filing %s (CIK %s): %s already holds its %s holdings",
                 filing.accession_no,
@@ -338,6 +342,69 @@ def backfill_13f(
             for summary in swept
         ],
     }
+
+
+@flow(name="13F-HR Compaction")
+def compact_13f(
+    year: int | None = None,
+    quarters: Sequence[int] = data.QUARTERS,
+    base_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Merge each extracted quarter of the lake into one file per partition.
+
+    The extraction writes a file per filer so that every filing lands atomically,
+    which leaves a quarter at a few thousand files and a backfilled lake at tens
+    of thousands — every one of which a reader opens. This flow merges each
+    quarter into the single ``holdings.parquet`` of its partition: the same rows
+    in the same layout, four files per year instead of thousands.
+
+    The merge converges, so the flow is safe to re-run and safe to schedule behind
+    an extraction: a filing extracted since the last run is a new part that the
+    next run merges in, and a quarter already merged is left untouched. A part
+    written *while* this runs is not in the merged file, so schedule it clear of
+    the extraction. ``year`` narrows the sweep to one report year and ``quarters``
+    to those quarters of every year it visits; neither means everything the lake
+    holds.
+    """
+    logger = get_run_logger()
+    lake = settings.base_dir(base_dir)
+    logger.info(
+        "13F-HR compaction started: year=%s quarters=%s base_dir=%s",
+        year if year is not None else "all",
+        ",".join(str(quarter) for quarter in quarters),
+        lake,
+    )
+
+    summary = storage.compact_holdings(
+        lake, years=None if year is None else (year,), quarters=quarters
+    )
+    for partition in summary["per_partition"]:
+        if partition["rewritten"]:
+            logger.info(
+                "Partition %dQ%d: merged %d files into %d rows, %d rows superseded",
+                partition["year"],
+                partition["quarter"],
+                partition["parts"],
+                partition["rows"],
+                partition["rows_superseded"],
+            )
+        else:
+            logger.info(
+                "Partition %dQ%d: already compacted, %d rows",
+                partition["year"],
+                partition["quarter"],
+                partition["rows"],
+            )
+    logger.info(
+        "13F-HR compaction finished: %d partitions merged, %d already compacted, %d files "
+        "removed, %d rows, %d rows superseded",
+        summary["rewritten"],
+        summary["skipped"],
+        summary["files_removed"],
+        summary["rows"],
+        summary["rows_superseded"],
+    )
+    return summary
 
 
 if __name__ == "__main__":

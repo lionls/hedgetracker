@@ -7,7 +7,7 @@ import json
 import sys
 
 from hedgetracker import data, settings, storage
-from hedgetracker.flows.sec_13f import backfill_13f, extract_quarterly_13f
+from hedgetracker.flows.sec_13f import backfill_13f, compact_13f, extract_quarterly_13f
 
 
 def _quarters(text: str) -> tuple[int, ...]:
@@ -102,6 +102,31 @@ def _parser() -> argparse.ArgumentParser:
         help="rewrite every file, not just the ones whose schema is out of date "
         "(needed when a derived column's values change)",
     )
+
+    compact = subcommands.add_parser(
+        "compact",
+        help="merge the lake's per-filer holdings files into one file per quarter",
+        description="Merge every quarter of the lake into the one Parquet file that "
+        "holds it, so a year of thousands of per-filer files reads as four. "
+        "Nothing is requested from EDGAR, a quarter already merged is left "
+        "untouched, and a filing extracted after a merge is merged in by the next "
+        "run. Run it while the extraction is idle.",
+    )
+    _add_base_dir_option(compact)
+    compact.add_argument(
+        "--year",
+        type=int,
+        default=None,
+        help="merge only this report year (default: every year the lake holds)",
+    )
+    compact.add_argument(
+        "--quarters",
+        type=_quarters,
+        default=data.QUARTERS,
+        metavar="1,2,3,4",
+        help=f"quarters to merge in every year visited "
+        f"(default: {','.join(map(str, data.QUARTERS))})",
+    )
     return parser
 
 
@@ -127,6 +152,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "conform":
         summary = storage.conform_holdings(settings.base_dir(args.base_dir), force=args.force)
+    elif args.command == "compact":
+        summary = compact_13f(
+            year=args.year,
+            quarters=args.quarters,
+            base_dir=settings.base_dir(args.base_dir),
+        )
     else:
         raise AssertionError(f"unhandled command {args.command!r}")
     json.dump(summary, sys.stdout, indent=2)

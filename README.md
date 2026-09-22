@@ -16,11 +16,14 @@ extract_13f_holdings (task, .map over every filing)
         │  filing.obj() → infotable → normalize → enforce_schema
         ▼
 {base_dir}/13f_holdings/year={YYYY}/quarter={Q}/{CIK}.parquet
+        └─ one file per filer, or one holdings.parquet per quarter once compacted
 ```
 
 * **Idempotent** — one Parquet file per filer, written atomically, and a filing
   whose quarter is already in the lake is skipped rather than rewritten: a re-run
-  reads only what is missing.
+  reads only what is missing. Merging a quarter's files into one (`compact`,
+  below) keeps that behaviour exactly — a merged partition answers for the filers
+  in it just as their own files did.
 * **Strict schema** — every file conforms to `EXPECTED_SCHEMA` (PyArrow), missing
   source columns are created as nulls, and `"nan"`/`"None"` placeholders become
   real nulls. A partition always reads back as one coherent table.
@@ -42,10 +45,10 @@ src/hedgetracker/
 ├── reference.py         # bundled CUSIP → ticker lookup
 ├── storage.py           # Hive-style partition paths + atomic Parquet writes
 ├── settings.py          # env-backed configuration
-├── cli.py               # `hedgetracker run|backfill|conform ...`
+├── cli.py               # `hedgetracker run|backfill|conform|compact ...`
 ├── data.py              # edgartools access helpers (identity, filing lookup)
 └── flows/
-    └── sec_13f.py       # extract_13f_holdings task + extract_quarterly_13f flow
+    └── sec_13f.py       # extraction task, quarterly/backfill flows, lake compaction
 tests/                   # offline unit tests + `-m live` SEC integration tests
 server/                  # Go + DuckDB backend for the market explorer
 ├── main.go              # flags, boot-time warm, graceful shutdown
@@ -174,6 +177,63 @@ already in the lake are skipped rather than rewritten, so a full backfill would
 leave the old files exactly as they are. A `base_dir` with no holdings files at
 all is an error rather than a no-op, because it usually means a typo.
 
+### Compacting the lake
+
+One file per filer is what makes each filing's write atomic and a re-run cheap,
+but a real quarter is a few thousand filings and a backfilled lake is tens of
+thousands of files, every one of which a reader has to open. Merging them is a
+separate job from extraction because the two have opposite shapes: extraction
+writes many small files concurrently, a merge rewrites one partition whole.
+
+```bash
+uv run hedgetracker compact                     # every quarter the lake holds
+uv run hedgetracker compact --year 2024         # one report year
+uv run hedgetracker compact --year 2024 --quarters 1,2
+```
+
+| Flag | Required | Meaning |
+| --- | --- | --- |
+| `--base-dir` | no | Data lake root, as for `run` |
+| `--year` | no | Merge only this report year (default: every year the lake holds) |
+| `--quarters` | no | Quarters to merge in every year visited (default: `1,2,3,4`) |
+
+`compact` walks the partitions in scope and merges each quarter's per-filer files
+into the single `holdings.parquet` beside them: the same rows in the same
+partition, four files per year instead of thousands. Nothing is requested from
+EDGAR, `conform` is not needed first, and a quarter with no per-filer files left
+is left alone — on an already merged lake the run rewrites nothing at all. A
+`base_dir` that holds no holdings, or a scope the lake has no partition for, is an
+error rather than a no-op, because both usually mean a typo.
+
+The merge is convergent, which is what makes it safe to schedule behind the
+extraction. A filer's file is the unit of truth — one file per filer and quarter,
+written whole by an extraction — so the per-filer files are read first, the
+merged file's rows *for those filers* are dropped, and the parts are appended: a
+filing extracted *after* a merge supersedes that filer's merged rows rather than
+being counted twice. Every line a part holds survives, because a 13F table holds
+one line per security and a filer may report the same security more than once;
+the one-row-per-(filer, period, CUSIP) collapse belongs to the explorer's
+aggregate, not to the lake. The merged file is written atomically and only then
+are those parts removed: interrupted in between, the partition is one the next run
+merges to the same result. Merging does not stop the extraction either — the
+"already extracted" test answers for both layouts, so nothing is downloaded or
+written twice — but run it while the extraction is idle: a file written *during* a
+merge stays a per-filer file until the next run, and editing a file a running
+merge has already read is the one way to lose a row.
+
+One quarter is the working set: each partition is read, merged and written whole,
+and every file is re-projected through `enforce_schema` on the way in, so a file
+extracted under an older schema — before the CUSIP-derived ticker existed — is
+upgraded by the merge rather than carried into the merged file.
+
+Compaction is also a new Prefect deployment (`13f-compact`, see
+[Docker Compose](#docker-compose)) because it is schedulable maintenance, not a
+step of any one extraction run: `year` and `quarters` are its parameters, and a
+run with `year: null` merges whatever is not merged yet. The explorer needs
+nothing for it: it reads `…/quarter=Q/*.parquet`, so a merged quarter is one small
+read where there used to be thousands, and its materialised tables are unchanged.
+`/api/13f/status` picks up the new file count on the next build.
+
 ### Partitioning
 
 `year` / `quarter` in the flow arguments select **which EDGAR quarterly index to
@@ -186,6 +246,12 @@ Files are written as `{base_dir}/13f_holdings/year={YYYY}/quarter={Q}/{CIK}.parq
 with the CIK zero-padded to the SEC's canonical 10 digits. The layout is
 Hive-partitioned and path-based only, so the base directory can be swapped for an
 S3/GCS prefix without touching flow code.
+
+A quarter that has been merged holds `…/quarter={Q}/holdings.parquet` instead of
+those per-filer files (see [Compacting the lake](#compacting-the-lake)): same
+partition, same rows, one file. Readers glob the partition directory rather than
+assume either name, and a filer counts as extracted if its own file is there or if
+the merged file's `cik` column lists it.
 
 ### SEC load, rate limits and failures
 
@@ -210,7 +276,7 @@ The extraction therefore distinguishes four outcomes per filing:
 
 | Outcome | Meaning | Effect |
 | --- | --- | --- |
-| already extracted | the filing's own file is in the lake, read from its index page | counted as `skipped_existing`; nothing downloaded, parsed or written |
+| already extracted | the filing's file — or its quarter's merged file — is in the lake, read from its index page | counted as `skipped_existing`; nothing downloaded, parsed or written |
 | frame written | information table parsed | `{CIK}.parquet` in the `report_period` partition |
 | `None` | filing indexes no information table, or an empty one | counted as `skipped_no_holdings`, no file written |
 | `SECDocumentUnavailable` | the submission, its index or the table document could not be read | task retries (3 attempts, 15 s apart) |
@@ -806,8 +872,8 @@ docker compose up -d --build     # server + worker
 open http://localhost:4200       # Prefect UI
 ```
 
-The worker registers both deployments (`13f-quarterly` and `13f-backfill`) on
-startup, so a run is one command (or one click in the UI):
+The worker registers every deployment (`13f-quarterly`, `13f-backfill` and
+`13f-compact`) on startup, so a run is one command (or one click in the UI):
 
 ```bash
 docker compose exec worker \
@@ -824,7 +890,7 @@ docker compose exec worker \
 ```
 
 `13f-quarterly` defaults to `limit: 5` to stay polite to EDGAR; any parameter of
-either deployment can be overridden per run with `--param` (`limit`,
+those deployments can be overridden per run with `--param` (`limit`,
 `year`/`quarter`, `start_year`/`end_year`, `quarters` as a JSON list such as
 `--param quarters='[2,4]'`, `user_email`). Runs land
 in the `lake` volume (`/data/lake` in the containers, Hive partitions as
@@ -986,7 +1052,7 @@ run.
 
 ### Verification runs
 
-The offline suite passes (49 tests). The live smoke run
+The offline suite passes (58 tests). The live smoke run
 (`--year 2024 --quarter 4 --limit 25`, scratch lake) wrote 25 files / 1975 holding
 rows with no failures, in 24 s, spread over 8 report-period year partitions
 (`2017`-`2024` — a Q4 2024 index window, so the partition is the filer's own
@@ -1015,6 +1081,20 @@ it again rewrote nothing (`rewritten: 0`, `skipped: 25`) in 0.0 s, because the
 schema comparison reads Parquet metadata only. `--force` (1.0 s for the same 25
 files) re-derived the column on the ticker-era lake too, which is how the two
 lower-case CUSIPs above were picked up after the fact.
+
+`compact` was verified against copies of the same smoke lake (25 files, 3069 rows,
+11 report-period partitions) and against a synthetic one. Merging the smoke lake
+rewrote all 11 partitions in 0.6 s, removing 25 per-filer files with
+`rows_superseded: 0`, and the merged lake held the identical 3069 lines — the same
+`cik`/`cusip`/`value`/`sshPrnamt` multiset, no column gained or lost. Running it
+again rewrote nothing (`rewritten: 0`, `skipped: 11`) in 0.0 s. On a synthetic
+2,000-file lake (500 filers × 4 quarters, 100,000 lines) the merge took 8.1 s and
+left 4 files, again with every line kept. The explorer was then run against both
+copies of each lake, offline: `filings`, `funds`, `positions`, `flows` and
+`signals` were identical (25/9/2422/1153/1153 on the smoke lake,
+2000/500/10000/7500/7500 on the synthetic one), `lakeFiles` fell 25 → 11 and
+2000 → 4, and the 13F build went from 4.68 s to 0.22 s — the same tables read from
+four files instead of two thousand.
 
 The sweep was verified end to end on a second Prefect server — the same image with
 `PREFECT_API_URL` pointed at it: the 2024 backfill ran its four windows as
