@@ -73,11 +73,16 @@ type SignalRow struct {
 	QuarterlyLow   *float64 `json:"quarterlyLow"`
 	QuarterlyHigh  *float64 `json:"quarterlyHigh"`
 	EstCapitalFlow *float64 `json:"estCapitalFlow"`
+	// The fund's name, empty on a lake the extractor has not named.
+	FilerName string `json:"filerName"`
 }
 
 // FundRow is one filer in the picker.
 type FundRow struct {
-	Cik             string  `json:"cik"`
+	Cik string `json:"cik"`
+	// The fund's name as EDGAR states it, empty on a lake the extractor has not
+	// named; the picker falls back to the CIK.
+	FilerName       string  `json:"filerName"`
 	Quarters        int64   `json:"quarters"`
 	FirstPeriod     string  `json:"firstPeriod"`
 	LatestPeriod    string  `json:"latestPeriod"`
@@ -123,29 +128,39 @@ func (a *API) thirteenfRefresh(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, a.thirteenF.Status())
 }
 
-// thirteenfFunds is the fund picker: every filer in the lake with its newest
-// portfolio, largest first. The lake stores no filer name, only the CIK.
+// thirteenfFunds is the fund picker: every filer in the lake with the portfolio
+// of its newest filing, largest first. `q` narrows it to the funds whose name or
+// CIK contains it, which is how a fund is found by either. A lake the extractor
+// has not named answers with the CIK in place of the name.
 func (a *API) thirteenfFunds(w http.ResponseWriter, r *http.Request) {
-	path, ok := a.thirteenF.tablePath(w, thirteenHoldings)
+	path, ok := a.thirteenF.tablePath(w, thirteenFunds)
 	if !ok {
 		return
 	}
 	limit := limitParam(r, 500, 5000)
-	query := fmt.Sprintf(`WITH latest AS (
-			SELECT cik, max(report_period) AS period, min(report_period) AS first_period,
-			       count(DISTINCT report_period) AS quarters
-			FROM %[1]s GROUP BY cik)
-		SELECT l.cik, l.quarters, l.first_period, l.period, h.portfolio_value_total, count(*)
-		FROM latest l JOIN %[1]s h ON h.cik = l.cik AND h.report_period = l.period
-		GROUP BY 1, 2, 3, 4, 5 ORDER BY 5 DESC LIMIT %[2]d`, thirteenFrom(path), limit)
+	from := thirteenFrom(path)
+	// A CIK is stored zero-padded and typed unpadded, so the digits are matched
+	// anywhere in it rather than at the start.
+	where := "1 = 1"
+	args := []any{}
+	if search := strings.TrimSpace(r.URL.Query().Get("q")); search != "" {
+		where = "cik LIKE '%' || ? || '%' OR filer_name ILIKE '%' || ? || '%'"
+		args = append(args, search, search)
+	}
+	query := fmt.Sprintf(`SELECT cik, filer_name, quarters, first_period, latest_period, latest_value_usd,
+			latest_positions
+		FROM %s WHERE %s ORDER BY latest_value_usd DESC, cik LIMIT %d`, from, where, limit)
 
 	funds := []FundRow{}
-	if err := a.thirteenRows(r.Context(), query, nil, func(rs *sql.Rows) error {
+	if err := a.thirteenRows(r.Context(), query, args, func(rs *sql.Rows) error {
 		var row FundRow
+		var filerName sql.NullString
 		var first, latest time.Time
-		if err := rs.Scan(&row.Cik, &row.Quarters, &first, &latest, &row.LatestValueUSD, &row.LatestPositions); err != nil {
+		if err := rs.Scan(&row.Cik, &filerName, &row.Quarters, &first, &latest,
+			&row.LatestValueUSD, &row.LatestPositions); err != nil {
 			return err
 		}
+		row.FilerName = filerName.String
 		row.FirstPeriod, row.LatestPeriod = formatPeriod(first), formatPeriod(latest)
 		funds = append(funds, row)
 		return nil
@@ -155,7 +170,8 @@ func (a *API) thirteenfFunds(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var total int64
-	if err := a.thirteenCount(r.Context(), fmt.Sprintf("SELECT count(DISTINCT cik) FROM %s", thirteenFrom(path)), nil, &total); err != nil {
+	if err := a.thirteenCount(r.Context(),
+		fmt.Sprintf("SELECT count(*) FROM %s WHERE %s", from, where), args, &total); err != nil {
 		a.thirteenFailed(w, "funds", err)
 		return
 	}
@@ -388,18 +404,20 @@ func (a *API) thirteenfSignals(w http.ResponseWriter, r *http.Request) {
 	query := fmt.Sprintf(`SELECT cik, report_period, prev_period, quarters_between, cusip, ticker, issuer, action,
 			shares, value_usd, portfolio_weight_pct, prev_shares, prev_value_usd, prev_portfolio_weight_pct,
 			delta_shares, delta_shares_pct, delta_value_usd, delta_weight_pct, split_factor, split_adjusted,
-			signal, quarterly_vwap, quarterly_low, quarterly_high, est_capital_flow
+			signal, quarterly_vwap, quarterly_low, quarterly_high, est_capital_flow, filer_name
 		FROM %s WHERE %s
 		ORDER BY abs(est_capital_flow) DESC NULLS LAST, abs(delta_weight_pct) DESC LIMIT %d`, from, clause, limit)
 	rows := []SignalRow{}
 	if err := a.thirteenRows(r.Context(), query, args, func(rs *sql.Rows) error {
 		row := SignalRow{}
+		var filerName sql.NullString
 		flow, err := scanFlow(rs, &row.Signal, &row.QuarterlyVWAP, &row.QuarterlyLow,
-			&row.QuarterlyHigh, &row.EstCapitalFlow)
+			&row.QuarterlyHigh, &row.EstCapitalFlow, &filerName)
 		if err != nil {
 			return err
 		}
 		row.FlowRow = flow
+		row.FilerName = filerName.String
 		rows = append(rows, row)
 		return nil
 	}); err != nil {

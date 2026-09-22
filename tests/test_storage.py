@@ -14,6 +14,7 @@ from hedgetracker.storage import (
     conform_holdings,
     extracted_path,
     holdings_path,
+    name_filers,
     partition_dir,
     write_holdings,
     year_quarter,
@@ -259,3 +260,38 @@ def test_extracted_path_notices_a_filer_merged_after_it_last_looked(tmp_path, in
     compact_holdings(tmp_path)
 
     assert extracted_path(tmp_path, 2024, 2, "0001067983") == compacted_path(tmp_path, 2024, 2)
+
+
+def test_name_filers_names_a_part_and_a_merged_quarter_then_writes_nothing(tmp_path, infotable):
+    part = _extract(tmp_path, infotable, "0001661222")
+    _extract(tmp_path, infotable, "0001067983", quarter=3, report_period="2024-09-30")
+    compact_holdings(tmp_path, quarters=(3,))
+
+    summary = name_filers(
+        tmp_path, {"1661222": "FAKE FUND 1661222", "1067983": "FAKE FUND 1067983"}
+    )
+
+    assert (summary["names"], summary["files"], summary["named"], summary["rows"]) == (2, 2, 2, 6)
+    assert set(pq.read_table(part).to_pandas()["filer_name"]) == {"FAKE FUND 1661222"}
+    merged = pq.read_table(compacted_path(tmp_path, 2024, 3)).to_pandas()
+    assert set(merged["filer_name"]) == {"FAKE FUND 1067983"}
+    assert list(partition_dir(tmp_path, 2024, 2).glob(".*")) == []
+    # The names are in place, so the next sweep of the lake rewrites nothing.
+    written = {path: path.stat().st_mtime_ns for path in (part, compacted_path(tmp_path, 2024, 3))}
+    again = name_filers(tmp_path, {"1661222": "FAKE FUND 1661222", "1067983": "FAKE FUND 1067983"})
+    assert (again["named"], again["rows"]) == (0, 0)
+    assert {path: path.stat().st_mtime_ns for path in written} == written
+
+
+def test_name_filers_names_only_the_filer_it_was_given_inside_a_merged_quarter(tmp_path, infotable):
+    """One quarter, two filers, one name: only that filer's rows are written."""
+    _extract(tmp_path, infotable, "0001661222")
+    _extract(tmp_path, infotable, "0001067983")
+    compact_holdings(tmp_path)
+
+    summary = name_filers(tmp_path, {"1661222": "FAKE FUND 1661222"})
+
+    assert (summary["files"], summary["named"], summary["rows"]) == (1, 1, 3)
+    merged = pq.read_table(compacted_path(tmp_path, 2024, 2)).to_pandas()
+    assert set(merged.loc[merged["cik"] == "0001661222", "filer_name"]) == {"FAKE FUND 1661222"}
+    assert merged.loc[merged["cik"] == "0001067983", "filer_name"].isna().all()

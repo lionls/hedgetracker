@@ -12,6 +12,11 @@ frame that reaches the data lake is passed through :func:`enforce_schema`, which
 * casts every column to its exact nullable dtype, mapping placeholder tokens to
   real nulls.
 
+The information table states no filer — it holds only what the fund bought — so
+``filer_name`` is the one column the extraction fills in from the filing itself,
+which is what lets a reader name a fund instead of numbering it. It is null in a
+lake extracted before the column existed; the next sweep of that window names it.
+
 The result is byte-for-byte schema compatible, so a partition can be read back as
 a single coherent table regardless of which filer produced which file.
 """
@@ -31,6 +36,7 @@ EXPECTED_SCHEMA: Final[dict[str, str]] = {
     "cik": "string",
     "report_period": "datetime64[ns]",
     "accession_number": "string",
+    "filer_name": "string",  # The reporting fund, from EDGAR's index of the filing
     "nameOfIssuer": "string",
     "titleOfClass": "string",
     "cusip": "string",

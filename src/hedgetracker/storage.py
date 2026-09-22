@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
@@ -171,6 +171,102 @@ def conform_holdings(base_dir: str | Path, *, force: bool = False) -> dict[str, 
         "force": force,
         "seconds": round(time.monotonic() - started, 1),
     }
+
+
+def name_filers(base_dir: str | Path, names: Mapping[str, str]) -> dict[str, Any]:
+    """Write the filers' names into the lake files that do not carry them yet.
+
+    The lake records the fund's name on every row it holds, so a reader can name
+    a fund rather than number it. ``names`` maps a CIK — padded or not — to the
+    name EDGAR's index states for that filer, which is where the extraction gets
+    it: a lake that predates the column is named by sweeping its windows again,
+    which re-reads index pages and no submission, because the filing is recognised
+    as already extracted before its documents are touched.
+
+    A file whose rows already carry the name is left alone, down to its
+    modification time, so a sweep can name the lake as often as it runs and only
+    the files it can add something to cost a read. Only the filers in ``names``
+    are considered, which keeps the walk at a lookup per file.
+    """
+    started = time.monotonic()
+    wanted = {cik_key(cik): name.strip() for cik, name in names.items() if name and name.strip()}
+    files = holdings_files(base_dir)
+    considered = 0
+    named = 0
+    rows = 0
+    for path in files:
+        # A per-filer file is named after the CIK it holds, so the filers a window
+        # does not own are skipped without opening a file at all. A compacted
+        # quarter holds every filer of a quarter and has to be asked.
+        if path.name != COMPACTED_NAME and path.stem not in wanted:
+            continue
+        considered += 1
+        unnamed = _unnamed_ciks(path, wanted)
+        if not unnamed:
+            continue
+        holdings = enforce_schema(pq.read_table(path).to_pandas())
+        missing = holdings["cik"].isin(unnamed) & holdings["filer_name"].isna()
+        if not missing.any():
+            continue
+        holdings.loc[missing, "filer_name"] = holdings.loc[missing, "cik"].map(wanted)
+        write_holdings(holdings, path)
+        named += 1
+        rows += int(missing.sum())
+    return {
+        "base_dir": str(base_dir),
+        "names": len(wanted),
+        "files": considered,
+        "named": named,
+        "rows": rows,
+        "skipped": considered - named,
+        "seconds": round(time.monotonic() - started, 1),
+    }
+
+
+def _unnamed_ciks(path: Path, wanted: Collection[str]) -> frozenset[str]:
+    """The CIKs of ``wanted`` that ``path`` holds rows for without a filer name.
+
+    Parquet records a column's null count per row group, so a file the names have
+    already reached is recognised from its metadata and no data page is read —
+    which is what keeps a sweep of a compacted lake cheap. A file that cannot
+    answer, because it was written before the column existed or without column
+    statistics, is read for its two columns instead.
+    """
+    file = pq.ParquetFile(path)
+    index = _leaf_column(file, "filer_name")
+    if index is not None and file.metadata.num_rows > 0:
+        statistics = [
+            file.metadata.row_group(group).column(index).statistics
+            for group in range(file.metadata.num_row_groups)
+        ]
+        if all(
+            statistic is not None and statistic.has_null_count and statistic.null_count == 0
+            for statistic in statistics
+        ):
+            return frozenset()
+    table = pq.read_table(path, columns=["cik"] if index is None else ["cik", "filer_name"])
+    ciks = table.column("cik").to_pylist()
+    if index is None:
+        return frozenset(cik for cik in ciks if cik in wanted)
+    names = table.column("filer_name").to_pylist()
+    return frozenset(
+        cik for cik, name in zip(ciks, names, strict=True) if cik in wanted and not name
+    )
+
+
+def _leaf_column(file: pq.ParquetFile, name: str) -> int | None:
+    """Index of ``name`` among the file's leaf columns, or ``None`` if absent.
+
+    The metadata's column order is the Parquet schema's, which matches the Arrow
+    fields for the flat, primitive columns a holdings file is made of; the names
+    are compared anyway so a file that says otherwise is read rather than
+    mis-indexed.
+    """
+    try:
+        index = file.schema_arrow.names.index(name)
+    except ValueError:
+        return None
+    return index if file.metadata.schema.column(index).name == name else None
 
 
 def partitions(base_dir: str | Path) -> tuple[tuple[int, int], ...]:

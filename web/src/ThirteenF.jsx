@@ -22,7 +22,11 @@ const HOLDINGS_STEP = 25;
 export default function ThirteenF() {
   const [status, setStatus] = useState(null);
   const [funds, setFunds] = useState([]);
-  const [cik, setCik] = useState('');
+  // The selection is the fund itself rather than its CIK: the picker searches on
+  // the server, so the selected fund can drop out of the list it was picked from,
+  // and the name the heading shows has to survive that.
+  const [fund, setFund] = useState(null);
+  const [query, setQuery] = useState('');
   const [wanted, setWanted] = useState('');
   const [holdings, setHoldings] = useState(null);
   const [quarters, setQuarters] = useState([]);
@@ -36,6 +40,7 @@ export default function ThirteenF() {
   const wasBuilding = useRef(false);
 
   const building = status?.state === 'building';
+  const cik = fund?.cik || '';
 
   // The status is the page's health line: read once, then followed while a build
   // runs. The version it bumps at the end is what makes the panels reread tables
@@ -62,20 +67,31 @@ export default function ThirteenF() {
     wasBuilding.current = building;
   }, [building]);
 
+  // The picker follows the search box: the server matches a name or a CIK, so a
+  // fund can be found without the page holding the whole list. The delay is what
+  // keeps a typed name from being one request per keystroke.
   useEffect(() => {
     let active = true;
-    thirteenFunds().then(
-      (payload) => {
-        if (!active) return;
-        setFunds(payload.funds);
-        setCik((current) => current || payload.funds[0]?.cik || '');
+    const timer = setTimeout(
+      () => {
+        thirteenFunds(query).then(
+          (payload) => {
+            if (!active) return;
+            setFunds(payload.funds);
+            // The first fund is the opening view, and a running selection is left
+            // alone: a search is how the next fund is found, not a reset.
+            setFund((current) => current || payload.funds[0] || null);
+          },
+          (error) => active && setFailure(error.message),
+        );
       },
-      (error) => active && setFailure(error.message),
+      query ? 150 : 0,
     );
     return () => {
       active = false;
+      clearTimeout(timer);
     };
-  }, [version]);
+  }, [version, query]);
 
   // Holdings own the quarter: an empty period asks for the filer's newest, and
   // the response says which one that was. Both the headline and the two panels
@@ -118,8 +134,8 @@ export default function ThirteenF() {
     };
   }, [drill, version]);
 
-  function pickFund(next) {
-    setCik(next);
+  function pickFund(entry) {
+    setFund(entry);
     setWanted('');
     setChosen(null);
     setQuarters([]);
@@ -153,18 +169,32 @@ export default function ThirteenF() {
           <span>13f dashboard</span>
         </div>
         <Pages page="13f" />
+        <input
+          className="search"
+          type="search"
+          value={query}
+          placeholder="Fund name or CIK"
+          spellCheck={false}
+          onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={(event) => {
+            // Enter opens the largest fund the search matched, the fund the list
+            // puts first.
+            if (event.key === 'Enter' && funds[0]) pickFund(funds[0]);
+          }}
+        />
+        {query && funds.length === 0 ? <p className="note">no fund matches “{query}”</p> : null}
         <ul className="results funds">
           {funds.map((entry) => (
             <li key={entry.cik}>
               <button
                 type="button"
                 className={entry.cik === cik ? 'result active' : 'result'}
-                onClick={() => pickFund(entry.cik)}
-                title={`${entry.quarters} filings, ${period(entry.firstPeriod)} to ${period(
-                  entry.latestPeriod,
-                )}`}
+                onClick={() => pickFund(entry)}
+                title={`CIK ${entry.cik} · ${entry.quarters} filings, ${period(
+                  entry.firstPeriod,
+                )} to ${period(entry.latestPeriod)}`}
               >
-                <span className="ticker">{entry.cik}</span>
+                <span className="ticker">{entry.filerName || entry.cik}</span>
                 <span className="name">{dollars(entry.latestValueUsd)}</span>
                 <span className="sector">
                   {count(entry.latestPositions)} positions · {period(entry.latestPeriod)}
@@ -197,11 +227,15 @@ export default function ThirteenF() {
         <header className="headline">
           <div className="identity">
             <h1>
-              {cik || '—'}
+              {fund?.filerName || cik || '—'}
               <span className="company-name">
                 {holdings
-                  ? `${dollars(holdings.portfolioValueUsd)} portfolio`
-                  : 'a filer CIK: the lake carries no fund name'}
+                  ? `${fund?.filerName ? `CIK ${cik} · ` : ''}${dollars(
+                      holdings.portfolioValueUsd,
+                    )} portfolio`
+                  : cik
+                    ? `CIK ${cik}`
+                    : ''}
               </span>
             </h1>
             {holdings ? (

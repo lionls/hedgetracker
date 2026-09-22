@@ -520,9 +520,30 @@ body {
   background: transparent;
 }
 
-/* A CIK is ten digits and does not fit the shared 66 px ticker column. */
+/* A fund is named here, not numbered: the name takes the row with the value at
+   its right, and the positions and the period sit under the name. The shared
+   66 px ticker column is for a symbol. */
 .results.funds .result {
-  grid-template-columns: 78px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.results.funds .result .ticker {
+  overflow: hidden;
+  padding-right: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.results.funds .result .name {
+  text-align: right;
+}
+
+.results.funds .result .sector {
+  grid-column: 1 / -1;
+  /* The shared `.sector` rule styles the stocks page's select; inside a fund row
+     it is a plain caption under the name. */
+  margin: 0;
+  padding: 0;
 }
 
 .note {
