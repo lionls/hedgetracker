@@ -197,4 +197,7 @@ def holdings_frame(filing: Filing) -> pd.DataFrame | None:
     frame["cik"] = cik_key(filing.cik)
     frame["report_period"] = report.report_period
     frame["accession_number"] = report.accession_number
+    # The fund's name as EDGAR's index states it. `company` is set on the filing
+    # from that index entry, so naming the lake costs no request of its own.
+    frame["filer_name"] = filing.company
     return frame

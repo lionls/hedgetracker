@@ -36,6 +36,12 @@ extract_13f_holdings (task, .map over every filing)
   rather than being guessed at.
 * **Fund-flow ready** — `report_period` is always present, so quarter-over-quarter
   position deltas can be computed per filer.
+* **Named filers** — `filer_name` is the filer as EDGAR's quarterly index states
+  it, which costs no extra request: the window has already read the index entry,
+  and the information table — the filing's own contents — carries no filer name at
+  all. A lake extracted before the column existed keeps working and shows CIKs;
+  a sweep of its windows names it without downloading anything (see
+  [Naming a lake](#naming-a-lake)).
 
 ## Layout
 
@@ -176,6 +182,28 @@ This is the answer to "the schema changed, now what". A re-crawl is not: filings
 already in the lake are skipped rather than rewritten, so a full backfill would
 leave the old files exactly as they are. A `base_dir` with no holdings files at
 all is an error rather than a no-op, because it usually means a typo.
+
+### Naming a lake
+
+`filer_name` is the one column `conform` cannot fill in. Every other derived column
+is a function of what is already in the file — `report_period` from the rows,
+`ticker` from the CUSIP — while the filer's name exists only in EDGAR's quarterly
+index, which is where the extractor reads it from. `conform` therefore adds the
+column and leaves it null, and the dashboard falls back to the CIK until the lake
+is named.
+
+Naming a lake is a sweep of its windows. A window names every filing it lists —
+the ones it just downloaded and the ones it skipped because the lake already had
+them — so a sweep re-reads index pages and nothing else:
+
+```bash
+uv run hedgetracker backfill --start-year 2021 --end-year 2024
+```
+
+The window's filings are unchanged by it, and a filing that already carries its
+name is left untouched, so repeated sweeps write nothing after the first. A window
+capped with `--limit` names the filings it listed, no more: a smoke lake built with
+`--limit 25` is named by a sweep that carries the same cap.
 
 ### Compacting the lake
 
@@ -516,16 +544,17 @@ Three properties of the serving path matter to a client:
 | Route | Answer |
 | --- | --- |
 | `GET /api/13f/status` | `{"state":"ready","builtAt":"2026-09-16T20:06:09Z","buildSeconds":212.7,"lakeFiles":25,"filings":25,"funds":9,"positions":2422,"flows":1153,"signals":1153,"quarters":["2021-12-31",…,"2024-06-30"]}`; `state` is `ready`, `building`, `stale`, `failed` or `unconfigured`, `lastError` carries the last failed build, and `/api/health` carries `thirteenF` |
-| `GET /api/13f/funds` | `{"funds":[{"cik":"0000891943","quarters":1,"firstPeriod":"2024-06-30","latestPeriod":"2024-06-30","latestValueUsd":1501802000,"latestPositions":794},…],"total":9,"limit":500}` — one row per filer, its newest portfolio, largest first |
+| `GET /api/13f/funds` | `{"funds":[{"cik":"0000891943","filerName":"CENTAURUS FINANCIAL, INC.","quarters":1,"firstPeriod":"2024-06-30","latestPeriod":"2024-06-30","latestValueUsd":1501802000,"latestPositions":794},…],"total":9,"limit":500}` — one row per filer, its newest portfolio, largest first; `?q=` matches the CIK or the name (case-insensitive substring) and alters `total` with it, and `filerName` is `""` on a lake the extractor has not named |
 | `GET /api/13f/holdings?cik=2038506&period=2024Q2` | `{"cik":"0002038506","period":"2024-06-30","quarters":[…11 periods…],"portfolioValueUsd":131104358,"total":67,"holdings":[{"cusip":"464288679","ticker":"SHV","issuer":"ISHARES TR","classTitle":"SHORT TREAS BD","shares":127843,"valueUsd":14126679,"weightPct":10.7751,"reportedLines":1},…]}`; `period` takes a date, a quarter label or `latest`, and defaults to the filer's newest filing; the weights of a fund-quarter sum to 100% |
 | `GET /api/13f/flows?cik=2038506&action=NEW,ADDED` | `{"cik":"0002038506","period":"","actions":[…],"total":389,"flows":[{"cik":"0002038506","period":"2024-06-30","prevPeriod":"2024-03-31","quartersBetween":1,"cusip":"595112103","ticker":"MU","issuer":"MICRON TECHNOLOGY INC","action":"NEW","shares":17554,"valueUsd":2308878,"weightPct":1.7611,"prevShares":0,"deltaShares":17554,"deltaSharesPct":null,"deltaWeightPct":1.7611,"splitFactor":1,"splitAdjusted":false},…]}`; without `period` it reports the fund's whole history, newest first |
-| `GET /api/13f/signals?period=2024Q2&signal=HIGH_CONVICTION_BUY` | the flow shape plus `signal`, `quarterlyVwap`, `quarterlyLow`, `quarterlyHigh`, `estCapitalFlow`. The filters are `cik`, `ticker`, `period`, `action` and `signal`, and `period=latest` is the default; with no filters it answers the lake's newest quarter, largest estimated flow first, and for one fund and ticker it is the position: `?cik=2038506&period=2024Q2&ticker=NVDA` is `{"action":"TRIMMED","shares":20139,"prevShares":21720,"deltaShares":-1581,"splitFactor":10,"splitAdjusted":true,"weightPct":1.8977,"signal":"PASSIVE_REBALANCE","quarterlyVwap":100.3169,"estCapitalFlow":-158601}` |
+| `GET /api/13f/signals?period=2024Q2&signal=HIGH_CONVICTION_BUY` | the flow shape plus `signal`, `quarterlyVwap`, `quarterlyLow`, `quarterlyHigh`, `estCapitalFlow` and `filerName`. The filters are `cik`, `ticker`, `period`, `action` and `signal`, and `period=latest` is the default; with no filters it answers the lake's newest quarter, largest estimated flow first, and for one fund and ticker it is the position: `?cik=2038506&period=2024Q2&ticker=NVDA` is `{"action":"TRIMMED","shares":20139,"prevShares":21720,"deltaShares":-1581,"splitFactor":10,"splitAdjusted":true,"weightPct":1.8977,"signal":"PASSIVE_REBALANCE","quarterlyVwap":100.3169,"estCapitalFlow":-158601}` |
 | `GET /api/13f/vwap?ticker=NVDA` | `{"ticker":"NVDA","quarters":[{"symbol":"NVDA","year":2024,"quarter":2,"tradingDays":63,"firstTradeDate":"2024-04-01","lastTradeDate":"2024-06-28","totalVolume":27164691100,"vwap":100.3169,"low":75.606,"high":140.76},…]}` |
 | `POST /api/13f/refresh` | `202` with the status body, or `409` with it while a build is running |
 | `GET /*` | `web/dist`, falling back to `index.html` |
 
-The panels are these six calls and no more: a fund picker is `/funds`; a holdings
-table is `/holdings?cik=…` with its quarter selector filled from `quarters`; a
+The panels are these six calls and no more: a fund picker is `/funds`, searchable
+by name or CIK; a holdings table is `/holdings?cik=…` with its quarter selector
+filled from `quarters`; a
 "what changed" chart is `/flows?cik=…`, filtered by `action`; the dashboard's
 opening view — what conviction moved this quarter — is `/signals?period=…`; the
 drill-down from a signal row is `/signals?cik=…&ticker=…`, with the price context
@@ -553,8 +582,12 @@ Five things the numbers mean, which the SQL file argues in full:
   quarter's bars — the dataset ships `close` and `volume` and no intraday prices.
   `estCapitalFlow` is the split-adjusted share delta times it, so it is `null` for
   the third of positions whose ticker has no bars.
-* **The lake carries no filer name**, only the CIK and the issuer fields, so the
-  fund picker shows CIKs. A `filerName` column in the extractor's schema is the fix.
+* **A fund is named, not numbered.** `filer_name` is what the lake recorded from
+  EDGAR's index, so the fund picker, the headline and the conviction board show the
+  fund's name and keep the CIK a hover away, and the picker's search takes either.
+  A lake the extractor has not named answers with the CIK, which is a fallback and
+  not a defect: `conform` cannot invent that column, because the name is in the
+  index and not in the filing — see [Naming a lake](#naming-a-lake).
 
 `-13f-offline` builds the tables from the lake alone: the flows, the actions and
 the signals are unchanged, `estCapitalFlow` and the VWAP columns are `null`, and a
@@ -1101,3 +1134,31 @@ The sweep was verified end to end on a second Prefect server — the same image 
 subflows of one parent run on that instance, and a second sweep of the same range
 wrote nothing (`0 files, 4 filings already extracted`, every window reported
 complete) and left the lake byte-identical, checksums and timestamps included.
+
+`filer_name` was verified against copies of the smoke lake, offline. The window
+that lake came from named it without downloading anything: `backfill --start-year
+2021 --end-year 2024 --limit 25` reported `written: 0, skipped_existing: 25` for
+2024 Q3, and all 3,069 rows the lake already held came back with a name. The other
+fifteen windows in that sweep found nothing and extracted their own 25 filings
+each, named as they were written — 400 files, 205,171 rows, every row named, 181
+filers, and no CIK carrying two different spellings, which is what makes
+`arg_max(filer_name, report_period)` in `filer_names` safe. The files the naming
+rewrote were otherwise untouched: dropping `filer_name` and digesting every
+remaining column row by row left all 25 of the lake's original files identical to
+the copies taken before the sweep, 3,069 rows and all.
+
+The explorer was then run against both copies, offline. On the unnamed lake —
+25 files, 3,069 rows — the build was unchanged at 0.37 s and answered
+`{"cik":"0000891943","filerName":"",…}`, with `?q=891943` and `?q=0000891943` each
+returning that one fund and `?q=VANGUARD` returning `{"total":0}`. On the named
+lake — 400 files, 205,171 rows — the build took 1.9 s and answered 181 named
+funds: `?q=CENTAURUS`, `?q=centaurus financial` (lower case, two words) and
+`?q=891943` each returned the one fund, `CENTAURUS FINANCIAL, INC.` / 0000891943;
+`?q=BANK` returned the five filers whose name contains it; an unmatched query
+returned `{"total":0,"funds":[]}`; and the signal rows carried the name
+(`PENNEY FINANCIAL, LLC`). The built page showed names in the picker, in the
+headline (`HAHN CAPITAL MANAGEMENT LLC` over `CIK 0001171592 · $357.48B portfolio`)
+and in the conviction board's `FUND` column, with each picker row keeping its CIK
+and filing span in a `title`; typing `bank` in the picker's box narrowed the list
+to those five funds and left the open fund alone, and clicking one of them moved
+the headline and the holdings table to it.

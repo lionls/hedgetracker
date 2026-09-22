@@ -6,12 +6,13 @@ from dataclasses import dataclass, replace
 from datetime import date
 
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 from hedgetracker import data, settings, storage
 from hedgetracker.flows import sec_13f
-from hedgetracker.schema import ARROW_SCHEMA
+from hedgetracker.schema import ARROW_SCHEMA, enforce_schema
 
 
 @dataclass(frozen=True)
@@ -169,6 +170,10 @@ def test_extracts_every_filing_and_reports_a_summary(tmp_path, sec_edgar):
         "skipped_existing": 0,
         "skipped_no_holdings": 1,
         "holdings_rows": 2,
+        # Both files were written with their filer's name, so nothing was left to
+        # name: the pass only ever touches a file from before the column existed.
+        "named_files": 0,
+        "named_rows": 0,
     }
     assert sec_edgar == [settings.sec_identity_email()]
 
@@ -279,6 +284,41 @@ def test_a_merged_lake_still_skips_the_filings_it_holds(tmp_path, monkeypatch, s
     for year, quarter in ((2024, 2), (2023, 4)):
         partition = tmp_path / "13f_holdings" / f"year={year}" / f"quarter={quarter}"
         assert [path.name for path in partition.glob("*.parquet")] == ["holdings.parquet"]
+
+
+def test_sweeping_a_window_names_a_file_extracted_before_the_lake_had_the_name(
+    tmp_path, sec_edgar, infotable
+):
+    """A lake from the older schema is named by the sweep that skips its filings.
+
+    The name is not in the information table, so a file written before the
+    extractor recorded it can only be named from the window's index entry — which
+    costs no request and no download, because the filing is recognised as already
+    extracted before its documents are read.
+    """
+    part = tmp_path / "13f_holdings" / "year=2024" / "quarter=2" / "0001661222.parquet"
+    part.parent.mkdir(parents=True, exist_ok=True)
+    legacy_schema = pa.schema([field for field in ARROW_SCHEMA if field.name != "filer_name"])
+    legacy = enforce_schema(infotable().assign(cik="0001661222")).drop(columns=["filer_name"])
+    pq.write_table(pa.Table.from_pandas(legacy, schema=legacy_schema), part)
+
+    summary = sec_13f.extract_quarterly_13f(
+        user_email="mark@gmail.com", year=2024, quarter=3, base_dir=tmp_path
+    )
+
+    assert summary["skipped_existing"] == 1
+    assert summary["named_files"] == 1
+    assert summary["named_rows"] == 1
+    named = pq.read_table(part).to_pandas()
+    assert named.loc[0, "filer_name"] == "FAKE FUND 1661222"
+    # Naming put the file on the current schema, so a second sweep writes nothing.
+    assert named.loc[0, "nameOfIssuer"] == "AMAZON.COM INC"
+    modified = part.stat().st_mtime_ns
+    again = sec_13f.extract_quarterly_13f(
+        user_email="mark@gmail.com", year=2024, quarter=3, base_dir=tmp_path
+    )
+    assert (again["named_files"], again["named_rows"]) == (0, 0)
+    assert part.stat().st_mtime_ns == modified
 
 
 @pytest.mark.parametrize("index_page", [FakeHomepage(), UnreadableHomepage()])
@@ -467,6 +507,8 @@ def test_backfill_sweeps_every_closed_window_and_aggregates_the_totals(tmp_path,
         "written": 2,
         "skipped_existing": 6,
         "holdings_rows": 2,
+        "named_files": 0,
+        "named_rows": 0,
         "per_window": [
             {
                 "year": 2024,

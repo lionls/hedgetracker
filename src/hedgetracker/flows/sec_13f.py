@@ -1,9 +1,9 @@
 """Prefect extraction of quarterly SEC 13F-HR holdings into a Parquet data lake.
 
 ``extract_13f_holdings`` extracts a single filing; ``extract_quarterly_13f``
-fans the task out across one EDGAR quarterly index window; ``backfill_13f``
-sweeps every closed window; ``compact_13f`` merges an extracted quarter's
-per-filer files into one file per partition.
+fans the task out across one EDGAR quarterly index window and names the filers it
+found; ``backfill_13f`` sweeps every closed window; ``compact_13f`` merges an
+extracted quarter's per-filer files into one file per partition.
 """
 
 from __future__ import annotations
@@ -151,6 +151,28 @@ def extract_13f_holdings(filing: Filing, base_dir: str) -> dict[str, Any] | None
     }
 
 
+@task(name="name-13f-filers", cache_policy=NO_CACHE)
+def name_13f_filers(names: dict[str, str], base_dir: str) -> dict[str, Any]:
+    """Write the window's filer names into the lake files that do not carry one.
+
+    EDGAR's index states every filing's filer, and the window has already listed
+    the filings, so this costs no request and needs no submission: a lake that
+    predates the filer name is named by sweeping its windows again, and the
+    filings already in it are skipped as before. Naming a file that is already
+    named is a no-op, which is what lets the sweep run as often as it likes.
+    """
+    logger = get_run_logger()
+    summary = storage.name_filers(base_dir, names)
+    logger.info(
+        "Named filers: %d files rewritten (%d rows), %d already named, %d names offered",
+        summary["named"],
+        summary["rows"],
+        summary["skipped"],
+        summary["names"],
+    )
+    return summary
+
+
 @flow(
     name="13F-HR Extraction Pipeline",
     task_runner=ThreadPoolTaskRunner(max_workers=MAX_CONCURRENT_FILINGS),
@@ -211,6 +233,13 @@ def extract_quarterly_13f(
         len(skipped_existing),
         len(failed),
     )
+    # The window is what knows its filers' names, so it is also what names the
+    # files an earlier run wrote before the lake carried them — a filing that was
+    # skipped above is named here without being read again.
+    named = name_13f_filers(
+        {storage.cik_key(filing.cik): filing.company for filing in filings if filing.company},
+        str(lake),
+    )
     if failed:
         for failure in failed:
             logger.error("Filing failed: %s", failure)
@@ -230,6 +259,8 @@ def extract_quarterly_13f(
         "skipped_existing": len(skipped_existing),
         "skipped_no_holdings": len(states) - len(written) - len(skipped_existing),
         "holdings_rows": total_rows,
+        "named_files": named["named"],
+        "named_rows": named["rows"],
     }
 
 
@@ -304,12 +335,13 @@ def backfill_13f(
     holdings_rows = sum(summary["holdings_rows"] for summary in swept)
     logger.info(
         "13F-HR backfill finished: %d of %d windows swept, %d files, %d holdings rows, "
-        "%d filings already extracted, %d windows failed",
+        "%d filings already extracted, %d files named, %d windows failed",
         len(swept),
         len(windows),
         sum(summary["written"] for summary in swept),
         holdings_rows,
         sum(summary["skipped_existing"] for summary in swept),
+        sum(summary["named_files"] for summary in swept),
         len(failed),
     )
     if failed:
@@ -331,6 +363,8 @@ def backfill_13f(
         "written": sum(summary["written"] for summary in swept),
         "skipped_existing": sum(summary["skipped_existing"] for summary in swept),
         "holdings_rows": holdings_rows,
+        "named_files": sum(summary["named_files"] for summary in swept),
+        "named_rows": sum(summary["named_rows"] for summary in swept),
         "per_window": [
             {
                 "year": summary["year"],

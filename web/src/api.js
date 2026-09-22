@@ -122,8 +122,10 @@ export function thirteenStatus() {
   return getJSON('/13f/status');
 }
 
-export function thirteenFunds(limit = 500) {
-  return getJSON(`/13f/funds?limit=${limit}`);
+// thirteenFunds lists the funds in the lake, largest first. The search runs
+// server-side: a name or a CIK, or nothing for the whole list.
+export function thirteenFunds(search = '', limit = 500) {
+  return getJSON(`/13f/funds?${query({ q: search, limit })}`);
 }
 
 // thirteenHoldings answers the filer's newest quarter when period is empty, and

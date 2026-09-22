@@ -57,11 +57,16 @@ const (
 	thirteenPositionsBase = "positions_base"
 	thirteenPositions     = "positions"
 	thirteenHoldings      = "holdings_normalized"
-	thirteenVWAP          = "market_quarterly_vwap"
-	thirteenFlows         = "fund_quarterly_flows"
-	thirteenConviction    = "conviction_scores"
-	thirteenManifest      = "manifest.json"
-	thirteenTablesDir     = "tables"
+	// filer_names is the fund's name per CIK, read from the lake's filer_name
+	// column — or empty on a lake the extractor has not named, which is what
+	// leaves the dashboard showing a CIK.
+	thirteenFilerNames = "filer_names"
+	thirteenFunds      = "funds"
+	thirteenVWAP       = "market_quarterly_vwap"
+	thirteenFlows      = "fund_quarterly_flows"
+	thirteenConviction = "conviction_scores"
+	thirteenManifest   = "manifest.json"
+	thirteenTablesDir  = "tables"
 )
 
 // thirteenTables is what a build must produce, in dependency order. positions
@@ -69,8 +74,8 @@ const (
 // lines to one row per filer, period and CUSIP plus the security's names, and
 // materialising it first is what keeps every later stage off the raw lake.
 var thirteenTables = []string{
-	thirteenPositionsBase, thirteenPositions,
-	thirteenHoldings, thirteenVWAP, thirteenFlows, thirteenConviction,
+	thirteenFilerNames, thirteenPositionsBase, thirteenPositions,
+	thirteenHoldings, thirteenFunds, thirteenVWAP, thirteenFlows, thirteenConviction,
 }
 
 // thirteenChunked are the tables that must not read the whole lake in one
@@ -493,7 +498,7 @@ func (t *ThirteenF) count(ctx context.Context, conn *sql.Conn, stored *manifest)
 	return nil
 }
 
-// createRawViews builds the three views the SQL file expects. Their sources are
+// createRawViews builds the four views the SQL file expects. Their sources are
 // configuration, so they cannot live in the SQL file itself.
 func (t *ThirteenF) createRawViews(ctx context.Context, conn *sql.Conn) error {
 	lake := sqlString(filepath.ToSlash(filepath.Join(t.lakeDir, "**", "*.parquet")))
@@ -510,8 +515,26 @@ func (t *ThirteenF) createRawViews(ctx context.Context, conn *sql.Conn) error {
 			t.lakeDir, filepath.Dir(t.lakeDir))
 	}
 
+	// The filer's name is newer still: a lake extracted before the column existed
+	// has every holding but no name for the funds that hold it. That is worth
+	// degrading for rather than failing on — the dashboard shows the CIK until a
+	// sweep of the lake's windows names it — so the view keeps its columns and
+	// holds no rows instead.
+	filerNames := fmt.Sprintf("SELECT count(*) FROM (DESCRIBE SELECT * FROM read_parquet(%s)) WHERE column_name = 'filer_name'", lake)
+	var hasFilerName int
+	if err := conn.QueryRowContext(ctx, filerNames).Scan(&hasFilerName); err != nil {
+		return fmt.Errorf("read lake schema: %w", err)
+	}
+	filerNameSource := "SELECT NULL::VARCHAR AS cik, NULL::VARCHAR AS filer_name, NULL::DATE AS report_period WHERE false"
+	if hasFilerName > 0 {
+		filerNameSource = fmt.Sprintf(
+			"SELECT cik, filer_name, CAST(report_period AS DATE) AS report_period FROM read_parquet(%s)"+
+				" WHERE filer_name IS NOT NULL AND filer_name <> ''", lake)
+	}
+
 	views := []struct{ name, query string }{
 		{"raw_holdings", "SELECT * FROM read_parquet(" + lake + ")"},
+		{"raw_filer_names", filerNameSource},
 		{"raw_prices", t.priceSource()},
 		{"raw_splits", t.splitSource()},
 	}

@@ -59,7 +59,7 @@ export default function SignalTable({ rows, fund = false, onTicker }) {
                   name
                 )}
               </th>
-              {fund ? null : <td>{row.cik}</td>}
+              {fund ? null : <td title={`CIK ${row.cik}`}>{row.filerName || row.cik}</td>}
               <td>
                 <Badge tone={ACTION_TONE[row.action] || 'flat'}>{row.action}</Badge>
               </td>

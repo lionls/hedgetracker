@@ -6,14 +6,16 @@
 -- deviations are listed below and each one is backed by a measurement on a
 -- real lake.
 --
--- The caller creates three raw views before running this file, because their
+-- The caller creates four raw views before running this file, because their
 -- sources are configuration rather than SQL:
 --
---   raw_holdings  every holdings file of the lake, as written by the extractor
---   raw_prices    daily bars (symbol, report_date, close, volume, low, high);
---                 empty when no price source is configured
---   raw_splits    split events (symbol, report_date, split_factor); empty when
---                 no price source is configured
+--   raw_holdings     every holdings file of the lake, as written by the extractor
+--   raw_filer_names  the reporting filer's name per reporting row, empty on a
+--                    lake extracted before the column existed
+--   raw_prices       daily bars (symbol, report_date, close, volume, low, high);
+--                    empty when no price source is configured
+--   raw_splits       split events (symbol, report_date, split_factor); empty when
+--                    no price source is configured
 --
 -- Each view is materialised to Parquet once (see thirteenf.go): a live
 -- conviction view scans the whole remote price table and re-joins the lake,
@@ -92,6 +94,13 @@
 --    reporting filer; measured on the reference lake (3,069 raw rows) both
 --    forms agree on every position, and the ticker is the bundled CUSIP map
 --    either way.
+--
+-- 10. The filer's name is collapsed per filer (filer_names) instead of being
+--     carried through the position stages: it is the same variable-length
+--     aggregate state as deviation 9, one row per fund rather than one per
+--     security, and a reader joins it on the CIK. `funds` is what the fund picker
+--     reads, so that listing and searching the funds is one query the database
+--     answers rather than one the endpoint assembles over a whole lake.
 
 -- The collapse of the lake's reporting lines to one row per filer, period and
 -- CUSIP. Its aggregate state is fixed width - two sums and a count - which is
@@ -178,6 +187,49 @@ FROM positions p
 JOIN portfolio_totals t
   ON  t.cik = p.cik
   AND t.report_period = p.report_period;
+
+-- The reporting filer's name, one row per fund. The lake stores it on every row
+-- the filer reported, and raw_filer_names is empty on a lake the extractor has
+-- not named yet — the name stays null and a reader falls back to the CIK. The
+-- newest filing's spelling wins: a filer that renamed itself is known by the
+-- name it uses now.
+CREATE OR REPLACE VIEW filer_names AS
+SELECT
+  cik,
+  arg_max(filer_name, report_period) AS filer_name
+FROM raw_filer_names
+GROUP BY cik;
+
+-- The fund picker: one row per filer in the lake, with the portfolio of its
+-- newest filing. A view of its own rather than a query the endpoint writes,
+-- because listing the funds and searching them have to answer from the same set:
+-- a dashboard that assembles the list client-side cannot search what it did not
+-- fetch.
+CREATE OR REPLACE VIEW funds AS
+WITH periods AS (
+  SELECT
+    cik,
+    count(DISTINCT report_period) AS quarters,
+    min(report_period)            AS first_period,
+    max(report_period)            AS latest_period
+  FROM holdings_normalized
+  GROUP BY cik
+)
+SELECT
+  p.cik,
+  n.filer_name,
+  p.quarters,
+  p.first_period,
+  p.latest_period,
+  h.portfolio_value_total AS latest_value_usd,
+  count(*)                AS latest_positions
+FROM periods p
+JOIN holdings_normalized h
+  ON  h.cik = p.cik
+  AND h.report_period = p.latest_period
+LEFT JOIN filer_names n
+  ON n.cik = p.cik
+GROUP BY p.cik, n.filer_name, p.quarters, p.first_period, p.latest_period, h.portfolio_value_total;
 
 CREATE OR REPLACE VIEW market_quarterly_vwap AS
 SELECT
@@ -340,8 +392,11 @@ SELECT
     WHEN f.action = 'EXITED'                                          THEN 'CONVICTION_DUMP'
     WHEN f.action = 'HELD'                                            THEN 'MAINTAINED'
     ELSE 'ROUTINE_ADJUSTMENT'
-  END                                                                   AS signal
+  END                                                                   AS signal,
+  n.filer_name
 FROM fund_quarterly_flows f
+LEFT JOIN filer_names n
+  ON n.cik = f.cik
 LEFT JOIN market_quarterly_vwap m
   ON  m.symbol = f.ticker
   AND m.period_year = f.report_year
