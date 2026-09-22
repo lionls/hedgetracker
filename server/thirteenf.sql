@@ -101,6 +101,25 @@
 --     security, and a reader joins it on the CIK. `funds` is what the fund picker
 --     reads, so that listing and searching the funds is one query the database
 --     answers rather than one the endpoint assembles over a whole lake.
+--
+-- 11. P&L is an estimate of the marks, because a 13F reports no cost basis.
+--     position_quarter_pnl values a position at the previous filing's shares -
+--     already split-adjusted, deviation 4, as the price dataset is - marked at
+--     the change in its VWAP: prev_shares * (vwap_now - vwap_prev). Over a whole
+--     portfolio that is the same number as marking the book and netting the
+--     trades: a position opened this quarter was bought at this quarter's VWAP
+--     and so contributes nothing, and an exit is valued at the quarter's VWAP
+--     rather than at a sale price a filing does not carry. `priced` says whether
+--     both quarters' VWAPs exist, so a ticker the price dataset does not cover
+--     has a null P&L - a hole in the estimate, not a zero - and
+--     fund_quarterly_performance's coverage_pct is how much of the portfolio's
+--     reported value those holes cover. A fund that skipped a quarter
+--     (deviation 6) is marked from the quarter of its previous filing and the
+--     whole gap lands in one period, which quarters_between labels. The
+--     cumulative total is a window over the per-filing aggregate: one row per
+--     filing, so its state is the number of filings rather than the number of
+--     positions that deviation 8 rules out. It is an estimate from quarterly
+--     averages and says nothing about intra-quarter timing, fees or dividends.
 
 -- The collapse of the lake's reporting lines to one row per filer, period and
 -- CUSIP. Its aggregate state is fixed width - two sums and a count - which is
@@ -401,3 +420,133 @@ LEFT JOIN market_quarterly_vwap m
   ON  m.symbol = f.ticker
   AND m.period_year = f.report_year
   AND m.period_quarter = f.report_quarter;
+
+-- The marked P&L of every position a fund moved, one row per filer, period and
+-- CUSIP: the position as the two filings around it state it, and the two
+-- quarterly VWAPs it is marked at. The split-adjusted prev_shares of deviation 4
+-- is what makes the comparison legal, because the prices are split-adjusted too.
+-- A ticker with no bars either quarter keeps its row with a null P&L, so a
+-- reader can measure the hole rather than lose the position. The value columns
+-- are as reported and are not restated.
+CREATE OR REPLACE VIEW position_quarter_pnl AS
+WITH marked AS (
+  SELECT
+    f.*,
+    prev.quarterly_vwap AS prev_vwap,
+    cur.quarterly_vwap  AS cur_vwap
+  FROM fund_quarterly_flows f
+  LEFT JOIN market_quarterly_vwap prev
+    ON  prev.symbol = f.ticker
+    AND prev.period_year = year(f.prev_period)
+    AND prev.period_quarter = quarter(f.prev_period)
+  LEFT JOIN market_quarterly_vwap cur
+    ON  cur.symbol = f.ticker
+    AND cur.period_year = f.report_year
+    AND cur.period_quarter = f.report_quarter
+)
+SELECT
+  cik,
+  report_period,
+  report_year,
+  report_quarter,
+  prev_period,
+  quarters_between,
+  cusip,
+  ticker,
+  issuer,
+  action,
+  shares,
+  value_usd,
+  portfolio_weight_pct,
+  prev_shares,
+  prev_value_usd,
+  delta_shares,
+  delta_value_usd,
+  split_factor,
+  split_adjusted,
+  prev_vwap,
+  cur_vwap,
+  -- The previous filing's book marked at this quarter's VWAP. Null when either
+  -- quarter's VWAP is missing, because then nothing is being marked.
+  ROUND(prev_shares * (cur_vwap - prev_vwap), 0)                                              AS pnl_usd,
+  -- Against the position's previous mark, which is the only cost basis the lake
+  -- implies. A position that did not exist a quarter ago has no percentage.
+  ROUND(100.0 * prev_shares * (cur_vwap - prev_vwap) / NULLIF(prev_shares * prev_vwap, 0), 4) AS pnl_pct,
+  prev_vwap IS NOT NULL AND cur_vwap IS NOT NULL                                              AS priced
+FROM marked;
+
+-- The fund's own ledger, one row per filing in the lake: what the portfolio was
+-- worth, what it moved, and what the marks did to it. positions and
+-- portfolio_value_total come from the filing itself, so a filer whose first
+-- filing in the lake has nothing to compare against still opens the series with
+-- a portfolio - and with null P&L columns rather than with a fabricated zero.
+CREATE OR REPLACE VIEW fund_quarterly_performance AS
+WITH filings AS (
+  SELECT
+    cik,
+    report_period,
+    count(*)                   AS positions,
+    max(portfolio_value_total) AS portfolio_value_total
+  FROM holdings_normalized
+  GROUP BY cik, report_period
+),
+moves AS (
+  SELECT
+    cik,
+    report_period,
+    -- One previous filing per report period, so these are the filing's own.
+    max(prev_period)                             AS prev_period,
+    max(quarters_between)                        AS quarters_between,
+    count(*)                                     AS moved_positions,
+    count(*) FILTER (WHERE priced)               AS positions_with_pnl,
+    SUM(pnl_usd)                                 AS pnl_usd,
+    -- What the marked positions are worth now: the denominator of the coverage
+    -- ratio pairs with the filing's total reported value.
+    SUM(value_usd) FILTER (WHERE priced)         AS covered_value_usd,
+    count(*) FILTER (WHERE action = 'NEW')       AS new_positions,
+    count(*) FILTER (WHERE action = 'ADDED')     AS added_positions,
+    count(*) FILTER (WHERE action = 'TRIMMED')   AS trimmed_positions,
+    count(*) FILTER (WHERE action = 'EXITED')    AS exited_positions,
+    count(*) FILTER (WHERE action = 'HELD')      AS held_positions,
+    -- Bought and sold at the quarter's VWAP, which is what a share delta is
+    -- worth when no transaction price is filed. A move in a ticker the price
+    -- dataset does not cover is in neither sum, so the two counts say how much
+    -- of the flow the money columns actually saw.
+    SUM(delta_shares * cur_vwap) FILTER (WHERE action IN ('NEW', 'ADDED'))        AS purchased_usd,
+    SUM(-delta_shares * cur_vwap) FILTER (WHERE action IN ('TRIMMED', 'EXITED'))  AS sold_usd,
+    count(*) FILTER (WHERE action IN ('NEW', 'ADDED') AND priced)                 AS purchased_positions,
+    count(*) FILTER (WHERE action IN ('TRIMMED', 'EXITED') AND priced)            AS sold_positions
+  FROM position_quarter_pnl
+  GROUP BY cik, report_period
+)
+SELECT
+  f.cik,
+  f.report_period,
+  year(f.report_period)    AS report_year,
+  quarter(f.report_period) AS report_quarter,
+  m.prev_period,
+  COALESCE(m.quarters_between, 0)    AS quarters_between,
+  f.positions,
+  f.portfolio_value_total,
+  COALESCE(m.moved_positions, 0)     AS moved_positions,
+  COALESCE(m.positions_with_pnl, 0)  AS positions_with_pnl,
+  m.pnl_usd,
+  m.covered_value_usd,
+  ROUND(100.0 * m.covered_value_usd / NULLIF(f.portfolio_value_total, 0), 4) AS coverage_pct,
+  COALESCE(m.new_positions, 0)       AS new_positions,
+  COALESCE(m.added_positions, 0)     AS added_positions,
+  COALESCE(m.trimmed_positions, 0)   AS trimmed_positions,
+  COALESCE(m.exited_positions, 0)    AS exited_positions,
+  COALESCE(m.held_positions, 0)      AS held_positions,
+  m.purchased_usd,
+  m.sold_usd,
+  COALESCE(m.purchased_positions, 0) AS purchased_positions,
+  COALESCE(m.sold_positions, 0)      AS sold_positions,
+  -- A running total of the quarters that could be priced. SUM skips the nulls,
+  -- so a fund whose first filing has no previous filing starts at null and the
+  -- total begins in the quarter the estimate does.
+  SUM(m.pnl_usd) OVER (PARTITION BY f.cik ORDER BY f.report_period) AS cumulative_pnl_usd
+FROM filings f
+LEFT JOIN moves m
+  ON  m.cik = f.cik
+  AND m.report_period = f.report_period;

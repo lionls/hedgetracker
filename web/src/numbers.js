@@ -40,6 +40,12 @@ export function signedCount(value) {
   return signed(value, plain);
 }
 
+// plural writes a count with its noun: a lake that holds one filing otherwise
+// says "1 filings".
+export function plural(value, noun) {
+  return `${count(value)} ${noun}${value === 1 ? '' : 's'}`;
+}
+
 export function percent(value) {
   if (value === null || value === undefined) return '—';
   return `${plain.format(value)}%`;

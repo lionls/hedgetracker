@@ -1,8 +1,8 @@
 package main
 
 // The 13F side of the explorer: it reads the holdings lake the hedgetracker
-// extractor writes, turns it into the four views in thirteenf.sql, and serves
-// them as JSON for the dashboard. See thirteenf_api.go for the endpoints.
+// extractor writes, turns it into the views in thirteenf.sql, and serves them
+// as JSON for the dashboard. See thirteenf_api.go for the endpoints.
 //
 // Two sources, wired differently on purpose:
 //
@@ -64,9 +64,14 @@ const (
 	thirteenFunds      = "funds"
 	thirteenVWAP       = "market_quarterly_vwap"
 	thirteenFlows      = "fund_quarterly_flows"
-	thirteenConviction = "conviction_scores"
-	thirteenManifest   = "manifest.json"
-	thirteenTablesDir  = "tables"
+	// position_pnl is the P&L estimate: the flows marked at the two quarterly
+	// VWAPs around them. performance rolls those marks up per filing, which is
+	// the series the fund page charts.
+	thirteenPositionPnl = "position_quarter_pnl"
+	thirteenPerformance = "fund_quarterly_performance"
+	thirteenConviction  = "conviction_scores"
+	thirteenManifest    = "manifest.json"
+	thirteenTablesDir   = "tables"
 )
 
 // thirteenTables is what a build must produce, in dependency order. positions
@@ -75,7 +80,8 @@ const (
 // materialising it first is what keeps every later stage off the raw lake.
 var thirteenTables = []string{
 	thirteenFilerNames, thirteenPositionsBase, thirteenPositions,
-	thirteenHoldings, thirteenFunds, thirteenVWAP, thirteenFlows, thirteenConviction,
+	thirteenHoldings, thirteenFunds, thirteenVWAP, thirteenFlows,
+	thirteenPositionPnl, thirteenPerformance, thirteenConviction,
 }
 
 // thirteenChunked are the tables that must not read the whole lake in one
