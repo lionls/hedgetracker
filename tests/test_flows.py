@@ -250,6 +250,37 @@ def test_an_already_extracted_filing_is_not_read_again(tmp_path, monkeypatch, se
     assert summary["skipped_existing"] == 2
 
 
+def test_a_merged_lake_still_skips_the_filings_it_holds(tmp_path, monkeypatch, sec_edgar):
+    """Compaction must not cost the extraction its record of what the lake holds."""
+    sec_13f.extract_quarterly_13f(
+        user_email="mark@gmail.com", year=2024, quarter=3, base_dir=tmp_path
+    )
+    storage.compact_holdings(tmp_path)
+
+    read: list[str] = []
+    real_holdings_frame = data.holdings_frame
+
+    def recording_holdings_frame(filing):
+        read.append(filing.accession_no)
+        return real_holdings_frame(filing)
+
+    monkeypatch.setattr(data, "holdings_frame", recording_holdings_frame)
+
+    summary = sec_13f.extract_quarterly_13f(
+        user_email="mark@gmail.com", year=2024, quarter=3, base_dir=tmp_path
+    )
+
+    # Both merged filings are recognised without downloading their submissions;
+    # only the one that reports no holdings is read, and nothing is written back
+    # into the partitions the merge produced.
+    assert read == ["0002034595-24-000001"]
+    assert summary["skipped_existing"] == 2
+    assert summary["written"] == 0
+    for year, quarter in ((2024, 2), (2023, 4)):
+        partition = tmp_path / "13f_holdings" / f"year={year}" / f"quarter={quarter}"
+        assert [path.name for path in partition.glob("*.parquet")] == ["holdings.parquet"]
+
+
 @pytest.mark.parametrize("index_page", [FakeHomepage(), UnreadableHomepage()])
 def test_a_filing_without_a_usable_index_page_is_extracted_anyway(
     tmp_path, monkeypatch, infotable, index_page

@@ -52,3 +52,26 @@ deployments:
       user_email: mark@gmail.com
       start_year: 2013
       end_year: null
+
+  - name: 13f-compact
+    description: >-
+      Merge each extracted quarter of the lake into one Parquet file per
+      partition. The extraction writes a file per filer so that every filing lands
+      atomically; this leaves the same rows in the same layout, four files per
+      year instead of thousands. Convergent: a quarter already merged is left
+      untouched, and a filing extracted since the last run is merged in by the
+      next one.
+    entrypoint: src/hedgetracker/flows/sec_13f.py:compact_13f
+    tags:
+      - sec
+      - 13f
+      - compaction
+    work_pool:
+      name: process-pool
+    # year null means "every year the lake holds"; pass --param year=2024 to merge
+    # one report year only. Run it while the extraction is idle: a part written
+    # during a merge is not in the merged file, so it stays a part until the next
+    # run, and --param quarters=... narrows which quarters are visited.
+    parameters:
+      year: null
+      quarters: [1, 2, 3, 4]
