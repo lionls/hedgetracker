@@ -5,6 +5,7 @@ const PAGES = [
   { page: 'explorer', path: '/', label: 'Explorer' },
   { page: 'stocks', path: '/stocks', label: 'Stocks' },
   { page: '13f', path: '/13f', label: '13F' },
+  { page: 'funds', path: '/funds', label: 'Funds' },
 ];
 
 export default function Pages({ page }) {

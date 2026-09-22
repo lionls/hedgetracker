@@ -1,15 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
-import Pages from './Pages.jsx';
+import { useEffect, useState } from 'react';
 import ConvictionBoard from './ConvictionBoard.jsx';
 import FundMovements from './FundMovements.jsx';
-import {
-  thirteenFunds,
-  thirteenHoldings,
-  thirteenRefresh,
-  thirteenStatus,
-  thirteenVWAP,
-} from './api.js';
-import { count, dollars, period, percent, stamp } from './numbers.js';
+import FundPicker from './FundPicker.jsx';
+import { thirteenHoldings, thirteenVWAP } from './api.js';
+import { count, dollars, period, percent } from './numbers.js';
 
 // HOLDINGS_STEP is how much of a fund's portfolio the table grows per click: a
 // 794-position filing is one request but not one screen.
@@ -18,15 +12,14 @@ const HOLDINGS_STEP = 25;
 // The 13F dashboard. Three drill-downs share one page: a fund's quarter, a
 // ticker's price, and the whole lake's convictions. They are all reads of the
 // materialised tables, so a rebuild is the only thing that changes an answer,
-// and that is what the version counter is for.
+// and that is what the version counter is for — the sidebar that owns the status
+// behind a rebuild is FundPicker, which hands the version back here.
 export default function ThirteenF() {
   const [status, setStatus] = useState(null);
-  const [funds, setFunds] = useState([]);
   // The selection is the fund itself rather than its CIK: the picker searches on
   // the server, so the selected fund can drop out of the list it was picked from,
   // and the name the heading shows has to survive that.
   const [fund, setFund] = useState(null);
-  const [query, setQuery] = useState('');
   const [wanted, setWanted] = useState('');
   const [holdings, setHoldings] = useState(null);
   const [quarters, setQuarters] = useState([]);
@@ -34,64 +27,9 @@ export default function ThirteenF() {
   const [vwap, setVwap] = useState(null);
   const [visible, setVisible] = useState(HOLDINGS_STEP);
   const [chosen, setChosen] = useState(null);
-  const [failure, setFailure] = useState('');
-  const [busy, setBusy] = useState(false);
   const [version, setVersion] = useState(0);
-  const wasBuilding = useRef(false);
 
-  const building = status?.state === 'building';
   const cik = fund?.cik || '';
-
-  // The status is the page's health line: read once, then followed while a build
-  // runs. The version it bumps at the end is what makes the panels reread tables
-  // that just changed under them.
-  useEffect(() => {
-    let active = true;
-    thirteenStatus().then(
-      (payload) => active && setStatus(payload),
-      () => {},
-    );
-    return () => {
-      active = false;
-    };
-  }, [version]);
-
-  useEffect(() => {
-    if (!building) return undefined;
-    const timer = setTimeout(() => thirteenStatus().then(setStatus, () => {}), 2000);
-    return () => clearTimeout(timer);
-  }, [building, status]);
-
-  useEffect(() => {
-    if (wasBuilding.current && !building) setVersion((value) => value + 1);
-    wasBuilding.current = building;
-  }, [building]);
-
-  // The picker follows the search box: the server matches a name or a CIK, so a
-  // fund can be found without the page holding the whole list. The delay is what
-  // keeps a typed name from being one request per keystroke.
-  useEffect(() => {
-    let active = true;
-    const timer = setTimeout(
-      () => {
-        thirteenFunds(query).then(
-          (payload) => {
-            if (!active) return;
-            setFunds(payload.funds);
-            // The first fund is the opening view, and a running selection is left
-            // alone: a search is how the next fund is found, not a reset.
-            setFund((current) => current || payload.funds[0] || null);
-          },
-          (error) => active && setFailure(error.message),
-        );
-      },
-      query ? 150 : 0,
-    );
-    return () => {
-      active = false;
-      clearTimeout(timer);
-    };
-  }, [version, query]);
 
   // Holdings own the quarter: an empty period asks for the filer's newest, and
   // the response says which one that was. Both the headline and the two panels
@@ -146,82 +84,19 @@ export default function ThirteenF() {
     setChosen(null);
   }
 
-  async function refresh() {
-    setBusy(true);
-    setFailure('');
-    try {
-      setStatus(await thirteenRefresh());
-    } catch (error) {
-      setFailure(error.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const statusError = status?.error || status?.lastError || '';
   const shown = rows.slice(0, visible);
 
   return (
     <div className="app">
-      <aside className="sidebar">
-        <div className="brand">
-          hedgetracker
-          <span>13f dashboard</span>
-        </div>
-        <Pages page="13f" />
-        <input
-          className="search"
-          type="search"
-          value={query}
-          placeholder="Fund name or CIK"
-          spellCheck={false}
-          onChange={(event) => setQuery(event.target.value)}
-          onKeyDown={(event) => {
-            // Enter opens the largest fund the search matched, the fund the list
-            // puts first.
-            if (event.key === 'Enter' && funds[0]) pickFund(funds[0]);
-          }}
-        />
-        {query && funds.length === 0 ? <p className="note">no fund matches “{query}”</p> : null}
-        <ul className="results funds">
-          {funds.map((entry) => (
-            <li key={entry.cik}>
-              <button
-                type="button"
-                className={entry.cik === cik ? 'result active' : 'result'}
-                onClick={() => pickFund(entry)}
-                title={`CIK ${entry.cik} · ${entry.quarters} filings, ${period(
-                  entry.firstPeriod,
-                )} to ${period(entry.latestPeriod)}`}
-              >
-                <span className="ticker">{entry.filerName || entry.cik}</span>
-                <span className="name">{dollars(entry.latestValueUsd)}</span>
-                <span className="sector">
-                  {count(entry.latestPositions)} positions · {period(entry.latestPeriod)}
-                </span>
-              </button>
-            </li>
-          ))}
-        </ul>
-        <p className="count">
-          {status
-            ? `${status.state}${status.builtAt ? ` · ${stamp(status.builtAt)}` : ''}`
-            : 'reading the lake…'}
-        </p>
-        <button type="button" className="more" onClick={refresh} disabled={busy}>
-          {busy
-            ? 'rebuilding…'
-            : `rebuild tables${status?.buildSeconds ? ` (${status.buildSeconds.toFixed(1)} s)` : ''}`}
-        </button>
-        {status ? (
-          <p className="note">
-            {count(status.filings)} filings · {count(status.funds)} funds ·{' '}
-            {count(status.positions)} positions · {count(status.signals)} signals
-          </p>
-        ) : null}
-        {statusError ? <p className="note down">{statusError}</p> : null}
-        {failure ? <p className="note down">{failure}</p> : null}
-      </aside>
+      <FundPicker
+        page="13f"
+        tagline="13f dashboard"
+        fund={fund}
+        onFund={pickFund}
+        onStatus={setStatus}
+        version={version}
+        onVersion={() => setVersion((value) => value + 1)}
+      />
 
       <main className="main">
         <header className="headline">

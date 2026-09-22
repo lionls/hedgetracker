@@ -10,6 +10,7 @@ package main
 //	/api/13f/flows      fund_quarterly_flows, the period-over-period changes
 //	/api/13f/signals    conviction_scores, across funds, one ticker, or one fund
 //	/api/13f/vwap       market_quarterly_vwap for one ticker
+//	/api/13f/fund       one fund's quarter series and its marked positions
 //	/api/13f/refresh    rebuild the tables from the lake
 //
 // Rows are objects rather than the column arrays the price bars use: these
@@ -102,6 +103,59 @@ type VWAPRow struct {
 	VWAP           float64 `json:"vwap"`
 	Low            float64 `json:"low"`
 	High           float64 `json:"high"`
+}
+
+// FundSeriesRow is one quarter of a fund's ledger: what its filing was worth,
+// what it moved, and what the marks did to it. The P&L columns are null both for
+// a filer's first filing in the lake — there is no previous filing to mark
+// against — and for a quarter whose positions the price dataset does not cover.
+type FundSeriesRow struct {
+	Period             string   `json:"period"`
+	ReportYear         int64    `json:"reportYear"`
+	ReportQuarter      int64    `json:"reportQuarter"`
+	PrevPeriod         string   `json:"prevPeriod,omitempty"`
+	QuartersBetween    int64    `json:"quartersBetween"`
+	Positions          int64    `json:"positions"`
+	PortfolioValueUSD  float64  `json:"portfolioValueUsd"`
+	MovedPositions     int64    `json:"movedPositions"`
+	PositionsWithPnl   int64    `json:"positionsWithPnl"`
+	PnlUSD             *float64 `json:"pnlUsd"`
+	CumulativePnlUSD   *float64 `json:"cumulativePnlUsd"`
+	CoveredValueUSD    *float64 `json:"coveredValueUsd"`
+	CoveragePct        *float64 `json:"coveragePct"`
+	NewPositions       int64    `json:"newPositions"`
+	AddedPositions     int64    `json:"addedPositions"`
+	TrimmedPositions   int64    `json:"trimmedPositions"`
+	ExitedPositions    int64    `json:"exitedPositions"`
+	HeldPositions      int64    `json:"heldPositions"`
+	PurchasedUSD       *float64 `json:"purchasedUsd"`
+	SoldUSD            *float64 `json:"soldUsd"`
+	PurchasedPositions int64    `json:"purchasedPositions"`
+	SoldPositions      int64    `json:"soldPositions"`
+}
+
+// FundPositionRow is one position of one filing with the P&L the marks imply.
+// priced is false — and the P&L null — when the ticker has no VWAP for one of
+// the two quarters, which is a hole in the estimate rather than a flat quarter.
+type FundPositionRow struct {
+	Cusip           string   `json:"cusip"`
+	Ticker          string   `json:"ticker"`
+	Issuer          string   `json:"issuer"`
+	Action          string   `json:"action"`
+	Shares          float64  `json:"shares"`
+	ValueUSD        float64  `json:"valueUsd"`
+	WeightPct       float64  `json:"weightPct"`
+	PrevShares      float64  `json:"prevShares"`
+	DeltaShares     float64  `json:"deltaShares"`
+	DeltaValueUSD   float64  `json:"deltaValueUsd"`
+	QuartersBetween int64    `json:"quartersBetween"`
+	SplitFactor     float64  `json:"splitFactor"`
+	SplitAdjusted   bool     `json:"splitAdjusted"`
+	PrevVWAP        *float64 `json:"prevVwap"`
+	VWAP            *float64 `json:"vwap"`
+	PnlUSD          *float64 `json:"pnlUsd"`
+	PnlPct          *float64 `json:"pnlPct"`
+	Priced          bool     `json:"priced"`
 }
 
 var (
@@ -475,6 +529,163 @@ func (a *API) thirteenfVWAP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ticker": ticker, "quarters": quarters})
+}
+
+// thirteenSorts are the rankings the fund endpoint offers, the first one being
+// its default. A null P&L never outranks a number in either direction: a
+// position the price dataset does not cover is a hole in the estimate, not the
+// best or the worst performer.
+var thirteenSorts = []struct{ name, order string }{
+	{"value", "value_usd DESC, cusip"},
+	{"weight", "portfolio_weight_pct DESC, value_usd DESC"},
+	{"gain", "pnl_usd DESC NULLS LAST, value_usd DESC"},
+	{"loss", "pnl_usd ASC NULLS LAST, value_usd DESC"},
+}
+
+// thirteenfFund is one fund's page in one request: the quarter series from
+// fund_quarterly_performance, and the positions of one quarter from
+// position_quarter_pnl with the P&L the quarterly VWAPs imply. The series is
+// every filing the fund is in the lake for — the charts are the page — while the
+// positions answer for the quarter the request names, newest by default. A filer
+// whose first filing is the requested one has an empty positions list and a
+// series that still states what the filing was worth.
+func (a *API) thirteenfFund(w http.ResponseWriter, r *http.Request) {
+	path, ok := a.thirteenF.tablePath(w, thirteenPositionPnl)
+	if !ok {
+		return
+	}
+	performance, ok := a.thirteenF.tablePath(w, thirteenPerformance)
+	if !ok {
+		return
+	}
+	names, ok := a.thirteenF.tablePath(w, thirteenFilerNames)
+	if !ok {
+		return
+	}
+	cik, ok := cikParam(w, r)
+	if !ok {
+		return
+	}
+	sort, order, ok := sortOrder(w, r.URL.Query().Get("sort"))
+	if !ok {
+		return
+	}
+	limit := limitParam(r, 100, 2000)
+	from, performanceFrom := thirteenFrom(path), thirteenFrom(performance)
+
+	// performance has one row per filing, so it is also where the fund's quarters
+	// come from: a reader can select any quarter it filed, not only the ones it
+	// has a previous filing to mark against.
+	quarters, err := a.thirteenQuarters(r.Context(), performanceFrom, cik)
+	if err != nil {
+		a.thirteenFailed(w, "fund", err)
+		return
+	}
+	if len(quarters) == 0 {
+		writeError(w, http.StatusNotFound, "no filings for that filer; see /api/13f/funds")
+		return
+	}
+	period, ok := thirteenPeriod(w, r, quarters)
+	if !ok {
+		return
+	}
+	if !oneOf(quarters, period) {
+		writeError(w, http.StatusNotFound, "no filing for that filer in that period; see the quarters list")
+		return
+	}
+
+	seriesQuery := fmt.Sprintf(`SELECT report_period, report_year, report_quarter, prev_period,
+			quarters_between, positions, portfolio_value_total, moved_positions, positions_with_pnl,
+			pnl_usd, covered_value_usd, coverage_pct, new_positions, added_positions, trimmed_positions,
+			exited_positions, held_positions, purchased_usd, sold_usd, purchased_positions,
+			sold_positions, cumulative_pnl_usd
+		FROM %s WHERE cik = ? ORDER BY report_period`, performanceFrom)
+	series := []FundSeriesRow{}
+	if err := a.thirteenRows(r.Context(), seriesQuery, []any{cik}, func(rs *sql.Rows) error {
+		var row FundSeriesRow
+		var report, previous sql.NullTime
+		if err := rs.Scan(&report, &row.ReportYear, &row.ReportQuarter, &previous, &row.QuartersBetween,
+			&row.Positions, &row.PortfolioValueUSD, &row.MovedPositions, &row.PositionsWithPnl,
+			&row.PnlUSD, &row.CoveredValueUSD, &row.CoveragePct, &row.NewPositions,
+			&row.AddedPositions, &row.TrimmedPositions, &row.ExitedPositions, &row.HeldPositions,
+			&row.PurchasedUSD, &row.SoldUSD, &row.PurchasedPositions, &row.SoldPositions,
+			&row.CumulativePnlUSD); err != nil {
+			return err
+		}
+		row.Period = formatPeriod(report.Time)
+		if previous.Valid {
+			row.PrevPeriod = formatPeriod(previous.Time)
+		}
+		series = append(series, row)
+		return nil
+	}); err != nil {
+		a.thirteenFailed(w, "fund", err)
+		return
+	}
+
+	positionsQuery := fmt.Sprintf(`SELECT cusip, ticker, issuer, action, shares, value_usd,
+			portfolio_weight_pct, prev_shares, delta_shares, delta_value_usd, quarters_between,
+			split_factor, split_adjusted, prev_vwap, cur_vwap, pnl_usd, pnl_pct, priced
+		FROM %s WHERE cik = ? AND report_period = ? ORDER BY %s LIMIT %d`, from, order, limit)
+	positions := []FundPositionRow{}
+	if err := a.thirteenRows(r.Context(), positionsQuery, []any{cik, period}, func(rs *sql.Rows) error {
+		var row FundPositionRow
+		if err := rs.Scan(&row.Cusip, &row.Ticker, &row.Issuer, &row.Action, &row.Shares, &row.ValueUSD,
+			&row.WeightPct, &row.PrevShares, &row.DeltaShares, &row.DeltaValueUSD, &row.QuartersBetween,
+			&row.SplitFactor, &row.SplitAdjusted, &row.PrevVWAP, &row.VWAP, &row.PnlUSD, &row.PnlPct,
+			&row.Priced); err != nil {
+			return err
+		}
+		positions = append(positions, row)
+		return nil
+	}); err != nil {
+		a.thirteenFailed(w, "fund", err)
+		return
+	}
+
+	var total int64
+	if err := a.thirteenCount(r.Context(),
+		fmt.Sprintf("SELECT count(*) FROM %s WHERE cik = ? AND report_period = ?", from),
+		[]any{cik, period}, &total); err != nil {
+		a.thirteenFailed(w, "fund", err)
+		return
+	}
+	// An aggregate rather than a row: a lake the extractor has not named has no
+	// row for the fund at all, which leaves the name empty rather than failing.
+	var filerName string
+	if err := a.thirteenCount(r.Context(),
+		fmt.Sprintf("SELECT COALESCE(max(filer_name), '') FROM %s WHERE cik = ?",
+			thirteenFrom(names)), []any{cik}, &filerName); err != nil {
+		a.thirteenFailed(w, "fund", err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"cik": cik, "filerName": filerName, "period": period, "sort": sort,
+		"quarters": quarters, "series": series, "total": total, "limit": limit,
+		"positions": positions,
+	})
+}
+
+// sortOrder resolves one of the rankings a list endpoint offers, returning both
+// the name it matched and the ORDER BY that answers it, so the response can echo
+// which ranking produced the rows.
+func sortOrder(w http.ResponseWriter, raw string) (string, string, bool) {
+	name := strings.ToLower(strings.TrimSpace(raw))
+	if name == "" {
+		name = thirteenSorts[0].name
+	}
+	for _, sort := range thirteenSorts {
+		if sort.name == name {
+			return sort.name, sort.order, true
+		}
+	}
+	allowed := make([]string, 0, len(thirteenSorts))
+	for _, sort := range thirteenSorts {
+		allowed = append(allowed, sort.name)
+	}
+	writeError(w, http.StatusBadRequest, "unknown sort "+name+"; one of "+strings.Join(allowed, ", "))
+	return "", "", false
 }
 
 // thirteenRows runs a query over the materialised tables and hands every row to

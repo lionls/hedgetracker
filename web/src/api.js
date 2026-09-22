@@ -146,6 +146,16 @@ export function thirteenVWAP(ticker) {
   return getJSON(`/13f/vwap?${query({ ticker })}`);
 }
 
+// thirteenFund answers the fund analytics page: every filing the fund has in the
+// lake as a series (which is what makes the charts history rather than a
+// snapshot) plus the positions of one quarter, ranked by the sort the server
+// whitelists. An empty period is the newest filing the lake holds, and the
+// response's period is the one it settled on; a period that fund never filed is
+// a 404 carrying the quarters list.
+export function thirteenFund(cik, period = '', sort = 'value', limit = 2000) {
+  return getJSON(`/13f/fund?${query({ cik, period, sort, limit })}`);
+}
+
 // thirteenRefresh answers 202 when it started a build and 409 when one is
 // already running. Both bodies are the status, and both are states the
 // dashboard renders rather than errors, so neither is thrown: the status it

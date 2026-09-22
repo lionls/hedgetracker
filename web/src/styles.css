@@ -546,6 +546,117 @@ body {
   padding: 0;
 }
 
+/* The fund analytics charts: a panel per question, two to a row, each one a card
+   the chart draws into. The height is stated here rather than left to the chart
+   because the canvas is laid out at whatever height it is given. */
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  padding: 12px 0 0;
+}
+
+.chart-panel {
+  margin: 0;
+  padding: 12px 14px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.chart-panel figcaption {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  align-items: baseline;
+  padding-bottom: 8px;
+}
+
+.chart-panel h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.chart-panel figcaption .muted,
+.chart-panel .muted {
+  font-size: 11px;
+}
+
+/* The shared `.chart` rule holds the dashboard's one chart at 380 px; a panel of
+   a 2×2 grid needs less, and the P&L panel carries two panes. */
+.chart-panel .chart {
+  height: 210px;
+  min-height: 210px;
+}
+
+.chart-panel .chart.tall {
+  height: 260px;
+  min-height: 260px;
+}
+
+/* The quarter's P&L per position: one row per mark, the bar drawn out from the
+   axis at the centre of the track, so gains and losses read as one distribution
+   and the axis stays put as the page changes quarter. */
+.pnl-bars {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  max-width: 760px;
+}
+
+.pnl-bars li {
+  display: grid;
+  grid-template-columns: 78px minmax(0, 1fr) 96px 76px;
+  gap: 10px;
+  align-items: center;
+  padding: 3px 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.pnl-name {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pnl-track {
+  position: relative;
+  height: 16px;
+  border-radius: 3px;
+  background: rgba(35, 42, 53, 0.45);
+}
+
+.pnl-track::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  border-left: 1px solid var(--line);
+}
+
+.pnl-fill {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  border-radius: 2px;
+}
+
+.pnl-fill.up {
+  background: rgba(38, 166, 154, 0.7);
+}
+
+.pnl-fill.down {
+  background: rgba(239, 83, 80, 0.7);
+}
+
+.pnl-value,
+.pnl-pct {
+  text-align: right;
+  font-size: 12px;
+}
+
 .note {
   max-width: 80ch;
   margin: 14px 0 0;
@@ -580,5 +691,21 @@ body {
   .chart {
     height: 280px;
     min-height: 0;
+  }
+
+  /* One canvas at a time: two 2×2 panels side by side would be 160 px wide
+     each, which is a chart no longer worth drawing. */
+  .chart-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .chart-panel .chart {
+    height: 260px;
+    min-height: 260px;
+  }
+
+  .chart-panel .chart.tall {
+    height: 300px;
+    min-height: 300px;
   }
 }

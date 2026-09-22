@@ -453,26 +453,31 @@ second source for those names.
 
 #### Next
 
-The first use is enrichment: join each holding to the bar for its filing date to
-get a price and a position value, carry that quarter over quarter, and take a
-sector from `stock_profile` for grouping. Caching the Parquet files locally is
-deferred until that work needs it — `stock_prices` is 445 MiB and reads fine over
-HTTPS. The [market explorer](#market-explorer) below is the first consumer of
-these tables: it fetches a symbol's whole history in one query, which is the shape
-the join wants, and it makes the gap between a ticker the map knows and a ticker
-that has bars visible before any of that work starts.
+The first use was enrichment: the [13F dashboard](#13f-dashboard-endpoints) joins
+each holding to the bar for its filing date and carries it quarter over quarter
+through the VWAP tables, and the [funds page](#the-funds-page) is where that work
+is priced — a position's change in value between two filings, and a fund's
+portfolio value at every filing it made. The piece still missing is a sector from
+`stock_profile` for grouping. Caching the Parquet files locally stays deferred
+until that work needs it — `stock_prices` is 445 MiB and reads fine over HTTPS. The
+[market explorer](#market-explorer) below is the first consumer of these tables: it
+fetches a symbol's whole history in one query, which is the shape the join wants,
+and it makes the gap between a ticker the map knows and a ticker that has bars
+visible before any of that work starts.
 
 ## Market explorer
 
 `server/` and `web/` are a browser for those tables: a ticker search, a company
-card, a candlestick chart with volume, and a second page that lists operating
-companies with their financial statements. The Go process answers every request
+card, a candlestick chart with volume, a second page that lists operating
+companies with their financial statements, a 13F dashboard and a fund analytics
+page built on the same holdings lake. The Go process answers every request
 straight from the Parquet files on the Hub — no local copy of a table, no database
 file, nothing written outside DuckDB's spill directory in `/tmp` — and the React
-app is two pages with no router and no state library, because the whole app is six
-endpoints and a handful of pieces of state. Both pages are one component with a
-`page` prop, chosen from `location.pathname`; navigation is two `<a href>`s that
-reload the bundle, which is cheaper than a router for two pages of a local app.
+app is four pages with no router and no state library, because each page is a
+handful of endpoints and a handful of pieces of state. Every page is one
+component with a `page` prop, chosen from `location.pathname`; navigation is four
+`<a href>`s that reload the bundle, which is cheaper than a router for four pages
+of a local app.
 
 | | |
 | --- | --- |
@@ -502,7 +507,7 @@ response is gzipped. Price columns are `DECIMAL(16,4)` in the file and cast to
 
 The explorer serves the other half of the dataset: the 13F holdings lake the
 extractor writes — the one table it reads from disk instead of the Hub — joined to
-the same dataset's prices and split events and folded into the four views
+the same dataset's prices and split events and folded into the six views
 `server/thirteenf.sql` defines. The lake says what funds held; the dataset supplies
 the quarterly VWAP that turns a share change into an estimated capital flow.
 
@@ -512,12 +517,14 @@ the quarterly VWAP that turns a share change into an estimated capital flow.
 | `market_quarterly_vwap` | per ticker and quarter: trading days, first and last trade date, volume-weighted close, low and high |
 | `fund_quarterly_flows` | one row per position a fund changed between consecutive *filings*, with split-adjusted deltas and an action — NEW, ADDED, TRIMMED, EXITED or HELD |
 | `conviction_scores` | the flows joined to the VWAP: `estCapitalFlow`, and a signal — HIGH_CONVICTION_BUY, STANDARD_BUY, PASSIVE_REBALANCE, CONVICTION_DUMP, MAINTAINED or ROUTINE_ADJUSTMENT |
+| `position_quarter_pnl` | one row per position of a fund-quarter that has a previous filing: the split-adjusted mark `pnl_usd` = `prev_shares × (vwap_now − vwap_prev)` and its percentage, the cumulative mark over the fund's filings so far, and a `priced` flag |
+| `fund_quarterly_performance` | one row per fund-quarter: positions, portfolio value, how many positions moved and how many could be marked, that quarter's `pnl_usd`, the cumulative one, the covered value with its coverage percentage, and the bought/sold totals |
 
 Three properties of the serving path matter to a client:
 
 * **The tables are materialised, not queried live.** One conviction query reads the
   whole lake and the whole price table, which is minutes of work no dashboard
-  request can wait for. The server builds the four tables in the background at
+  request can wait for. The server builds the six tables in the background at
   startup, reports that build on `/api/13f/status`, keeps serving the previous build
   while a new one runs, and answers every data endpoint `503` — with the status in
   body — until the first build is ready. `POST /api/13f/refresh` starts one by
@@ -548,19 +555,23 @@ Three properties of the serving path matter to a client:
 | `GET /api/13f/holdings?cik=2038506&period=2024Q2` | `{"cik":"0002038506","period":"2024-06-30","quarters":[…11 periods…],"portfolioValueUsd":131104358,"total":67,"holdings":[{"cusip":"464288679","ticker":"SHV","issuer":"ISHARES TR","classTitle":"SHORT TREAS BD","shares":127843,"valueUsd":14126679,"weightPct":10.7751,"reportedLines":1},…]}`; `period` takes a date, a quarter label or `latest`, and defaults to the filer's newest filing; the weights of a fund-quarter sum to 100% |
 | `GET /api/13f/flows?cik=2038506&action=NEW,ADDED` | `{"cik":"0002038506","period":"","actions":[…],"total":389,"flows":[{"cik":"0002038506","period":"2024-06-30","prevPeriod":"2024-03-31","quartersBetween":1,"cusip":"595112103","ticker":"MU","issuer":"MICRON TECHNOLOGY INC","action":"NEW","shares":17554,"valueUsd":2308878,"weightPct":1.7611,"prevShares":0,"deltaShares":17554,"deltaSharesPct":null,"deltaWeightPct":1.7611,"splitFactor":1,"splitAdjusted":false},…]}`; without `period` it reports the fund's whole history, newest first |
 | `GET /api/13f/signals?period=2024Q2&signal=HIGH_CONVICTION_BUY` | the flow shape plus `signal`, `quarterlyVwap`, `quarterlyLow`, `quarterlyHigh`, `estCapitalFlow` and `filerName`. The filters are `cik`, `ticker`, `period`, `action` and `signal`, and `period=latest` is the default; with no filters it answers the lake's newest quarter, largest estimated flow first, and for one fund and ticker it is the position: `?cik=2038506&period=2024Q2&ticker=NVDA` is `{"action":"TRIMMED","shares":20139,"prevShares":21720,"deltaShares":-1581,"splitFactor":10,"splitAdjusted":true,"weightPct":1.8977,"signal":"PASSIVE_REBALANCE","quarterlyVwap":100.3169,"estCapitalFlow":-158601}` |
+| `GET /api/13f/fund?cik=2038506&period=2024-06-30&sort=value&limit=2000` | `{"cik":"0002038506","filerName":"","period":"2024-06-30","sort":"value","quarters":[…11 dates…],"series":[…11 rows…],"total":81,"limit":2000,"positions":[…81 rows…]}` — one row per filing in `series`, the cursor's quarter named by `period`, and the same row spelled out: `{"period":"2024-06-30","reportYear":2024,"reportQuarter":2,"prevPeriod":"2024-03-31","quartersBetween":1,"positions":67,"portfolioValueUsd":131104358,"movedPositions":81,"positionsWithPnl":63,"pnlUsd":-708441,"cumulativePnlUsd":-21396093,"coveredValueUsd":70700295,"coveragePct":53.9267,"newPositions":12,"addedPositions":27,"trimmedPositions":23,"exitedPositions":14,"heldPositions":5,"purchasedUsd":19978177.83,"soldUsd":17100750.04,"purchasedPositions":30,"soldPositions":29}`. Each position is the flow shape plus the mark: `{"cusip":"67066G104","ticker":"NVDA","issuer":"NVIDIA CORP","action":"TRIMMED","shares":20139,"valueUsd":2487972,"weightPct":1.8977,"prevShares":21720,"deltaShares":-1581,"deltaValueUsd":525440,"quartersBetween":1,"splitFactor":10,"splitAdjusted":true,"prevVwap":74.003,"vwap":100.3169,"pnlUsd":571538,"pnlPct":35.5579,"priced":true}` — `pnlUsd` is the split-adjusted `prevShares × (vwap − prevVwap)`, so the dataset's adjusted VWAPs carry the split and our `splitFactor` carries the shares. `period` takes a date, a quarter label or `latest`, and defaults to the newest filing; `sort` is one of `value`, `weight`, `gain`, `loss` and anything else is a `400`; `limit` (default 100, capped at 2000) cuts `positions` while `total` keeps the whole count |
 | `GET /api/13f/vwap?ticker=NVDA` | `{"ticker":"NVDA","quarters":[{"symbol":"NVDA","year":2024,"quarter":2,"tradingDays":63,"firstTradeDate":"2024-04-01","lastTradeDate":"2024-06-28","totalVolume":27164691100,"vwap":100.3169,"low":75.606,"high":140.76},…]}` |
 | `POST /api/13f/refresh` | `202` with the status body, or `409` with it while a build is running |
 | `GET /*` | `web/dist`, falling back to `index.html` |
 
-The panels are these six calls and no more: a fund picker is `/funds`, searchable
+The panels are these calls and no more: a fund picker is `/funds`, searchable
 by name or CIK; a holdings table is `/holdings?cik=…` with its quarter selector
 filled from `quarters`; a
 "what changed" chart is `/flows?cik=…`, filtered by `action`; the dashboard's
 opening view — what conviction moved this quarter — is `/signals?period=…`; the
 drill-down from a signal row is `/signals?cik=…&ticker=…`, with the price context
-beside it from `/vwap?ticker=…`; and the refresh button is `POST /refresh`.
+beside it from `/vwap?ticker=…`; and the refresh button is `POST /refresh`. The
+[funds page](#the-funds-page) adds one call of its own, `/fund?cik=…`, because
+every panel on it reads the same `series` array and splitting that into five
+requests would let the panels disagree with each other.
 
-Five things the numbers mean, which the SQL file argues in full:
+Six things the numbers mean, which the SQL file argues in full:
 
 * **A position is a CUSIP, and a filing can repeat one.** 184 (filer, period, CUSIP)
   groups in this lake carry more than one line item — up to five — and the views
@@ -588,9 +599,26 @@ Five things the numbers mean, which the SQL file argues in full:
   A lake the extractor has not named answers with the CIK, which is a fallback and
   not a defect: `conform` cannot invent that column, because the name is in the
   index and not in the filing — see [Naming a lake](#naming-a-lake).
+* **The P&L is an estimate from a mark, because a 13F has no cost basis.** A filing
+  states what a fund holds and what it is worth on the last day of the quarter, and
+  never what was paid for it, so `pnl_usd` is `prev_shares × (vwap_now − vwap_prev)`
+  on the split-adjusted shares: the change in the position's value with the
+  share count held fixed. A position that is new this quarter contributes exactly
+  `0` and carries a `null` percentage, because there is no earlier price to move
+  from; an exit is marked at the current quarter's VWAP, since that is the price the
+  dataset has when the position is gone. `quartersBetween > 1` puts the whole gap's
+  move into the quarter that reports it.
+* **A missing price is a coverage number, not a failure.** The dataset has no bars
+  for delisted names — `TWTR`, `ATVI` — so `priced` is `false` and the mark is
+  `null`, never a zero that would read as "this position did not move".
+  `positionsWithPnl`, `coveredValueUsd` and `coveragePct` say how much of the fund
+  the estimate actually covers, the charts skip null points rather than drawing
+  through them, and a panel with nothing priced left renders a sentence instead of
+  an empty canvas.
 
 `-13f-offline` builds the tables from the lake alone: the flows, the actions and
-the signals are unchanged, `estCapitalFlow` and the VWAP columns are `null`, and a
+the signals are unchanged, `estCapitalFlow`, the VWAP columns and every mark are
+`null`, so the funds page reports 0% coverage and says so on each panel, and a
 build takes a quarter of a second instead of three and a half minutes.
 
 ### The stocks page
@@ -667,6 +695,64 @@ chart's own first read; that is why the panel and the chart appear together. A
 figures read that fails is served with dashes but not cached, so a retry fills it
 in rather than pinning the dashes on the symbol for the life of the process.
 
+### The funds page
+
+`/funds` is the 13F lake drawn rather than tabulated: the same fund picker in the
+sidebar, then one quarter's figures above four `Over time` charts — portfolio value
+at each filing, the quarterly mark as bars with the running total as a line, money
+bought and sold, and positions opened and closed — a diverging bar panel of the
+quarter's per-position marks, and the positions behind them.
+
+**One request per page.** `GET /api/13f/fund?cik=…&period=…&sort=…&limit=…`
+answers the fund's whole history as a `series` array — one row per filing — with
+the selected quarter's `positions` beside it, and every figure and chart on the
+page reads that one array. A call per panel would have been five chances for the
+headline and a chart to disagree about the same quarter, and there is nothing to
+save by splitting it: eleven filings of one fund are eleven rows of `series`,
+which is nothing next to the price read the tables were built from. The quarter
+selector is `series`, the headline is the row whose `period` matches the one
+asked for, and the `Over time` charts are that array projected four ways.
+
+**The selected quarter is a row of the history, not a second answer.** `period`
+decides which row the headline reads and whose positions come back — nothing else.
+The positions are ordered and cut server-side, because that is what makes the
+table a page of 25 of 81 in the order that was asked for, so a quarter or a sort
+is a request; the charts never depend on it, and they redraw the same `series`
+either way.
+
+**Charts are created once and fed afterwards.** `lightweight-charts` wants its
+canvas mounted before it is given a series, so each panel builds its chart on mount
+and only calls `setData` on later renders. That makes the series *descriptor* part
+of the panel's identity: the P&L panel is a two-pane histogram-plus-line chart for
+its whole life, and a panel with no data to draw is a different component that
+replaces it — a sentence, not an empty canvas — rather than the same chart with an
+empty descriptor, which would have to destroy and rebuild the canvas underneath the
+page. A new fund or quarter is a new page and the panels blank rather than show the
+last one's bars under the new headline; a new sort is the same answer in a
+different order, keeps the response the charts already have, and moves only the
+table, so the canvases are not rebuilt at all.
+
+**The position bars are CSS, not a chart.** The panel lists the eight largest
+gains and the eight largest losses of the quarter — the shape of a quarter rather
+than the whole book, which is what the table underneath is for — each as a labelled
+row with a fill scaled to the largest mark in view, so the lengths stay comparable
+across the panel. Gains grow right of the axis and losses left, in the same two
+colours the `Over time` bars use; a position with no mark has no bar to place and
+is left out rather than drawn flat at zero, and the coverage figure above says how
+many that was. Elements rather than a canvas keep the labels crisp and the ranking
+readable at any width.
+
+**Sorting is a server-side whitelist** — `value`, `weight`, `gain`, `loss` — so the
+table can always be read as "this fund's largest positions", "what it gained most
+on" or "where it lost", and an unrecognised `sort` is a `400` naming the four
+values rather than a silent fallback to the default order.
+
+**A single-filing fund says why it is empty.** The flows tables exclude a fund's
+first filing, because there is nothing to compare it against, so a fund with one
+filing has no positions to show in the changed-position tables at all — the page
+renders its positions count and a sentence explaining the rule instead of an empty
+table with a sort control over nothing.
+
 ### Running it
 
 ```sh
@@ -732,7 +818,8 @@ and compress the bundle in front of the container if that matters. Only
 
 ### Measured
 
-Against the running server on 2026-09-15, over the proxy this sandbox uses:
+Against the running server on 2026-09-15, over the proxy this sandbox uses (the
+13F rows and the bundle row were re-measured on 2026-09-22):
 
 | Step | Measured |
 | --- | --- |
@@ -749,7 +836,10 @@ Against the running server on 2026-09-15, over the proxy this sandbox uses:
 | `GET /api/fundamentals/KO`, first read | 6.78 s, 1,991 B — five fiscal years, thirteen metrics, share count and trailing EPS |
 | `GET /api/fundamentals/KO` again, from the in-process cache | 0.51 ms |
 | The two reads behind that response, on a fresh DuckDB with the server's settings | 3.4 s (`stock_shares_outstanding` + `stock_tailing_eps`) + 3.0 s (`stock_statement`); 1.5 s + 1.5 s for the next symbol, whose file footers are already cached |
-| `npm run build` | 0.21 s — 124.77 kB gzipped JS, 1.56 kB gzipped CSS |
+| `GET /api/13f/fund?cik=2038506&period=2024-06-30&sort=value&limit=2000` | 19 ms, 32,293 B — 11 filings in `series` and all 81 positions; 11–23 ms over the next four reads, because the price scan behind it belongs to the build and not to the request |
+| `GET /api/13f/fund?cik=2038506&period=2024-06-30&limit=25`, a window rather than the whole book | 13,878 B for 25 of 81 positions |
+| Boot: the 13F build over the 25-file smoke lake with the real price dataset | 205.9 s — index warm 3.7 s, 12,333 priced symbols in 36.5 s, then the six tables |
+| `npm run build`, the four pages | 0.25 s — 428.27 kB JS (133.51 kB gzipped), 7.76 kB CSS (2.10 kB gzipped) |
 
 ### Why it is shaped this way
 
@@ -1162,3 +1252,78 @@ and in the conviction board's `FUND` column, with each picker row keeping its CI
 and filing span in a `title`; typing `bank` in the picker's box narrowed the list
 to those five funds and left the open fund alone, and clicking one of them moved
 the headline and the holdings table to it.
+
+The P&L tables were verified against the real price dataset — the smoke lake's 25
+files copied to a scratch lake, `stock_prices` and `stock_split_events` read from
+the Hub — which built in 205.9 s (index warm 3.7 s, 12,333 priced symbols in
+36.5 s, then the six tables). `GET /api/13f/fund?cik=2038506&period=2024-06-30&sort=value&limit=2000`
+answered in 19 ms with 32,293 B: 11 rows of `series`, 81 positions, `total` 81 —
+and 11 to 23 ms on the four reads after it, because the price scan belongs to the
+build and not to the request. The latest row read `positions 67`,
+`portfolioValueUsd 131104358`, `movedPositions 81`, `positionsWithPnl 63`,
+`pnlUsd -708441`, `cumulativePnlUsd -21396093`, `coveredValueUsd 70700295`,
+`coveragePct 53.9267` — 12 new, 27 added, 23 trimmed, 14 exited, 5 held, for
+`purchasedUsd 19978177.83` against `soldUsd 17100750.04` — and the marks on the 81
+positions behind it summed to exactly that `-708441`, so the headline figure and
+the table under the bars cannot disagree. NVDA came back as the split case:
+`prevShares 21720` at `prevVwap 74.003`, `shares 20139` at `vwap 100.3169`,
+`deltaShares -1581`, `deltaValueUsd 525440`, `splitFactor 10`,
+`splitAdjusted true`, `pnlUsd 571538`, `pnlPct 35.5579` — the 10:1 accounts for the
+whole share drop, and the mark is the quarter it started from: 21,720 shares marked
+from 74.003 to 100.3169, which is 21,720 × 26.3139 = 571,538. Biggest losses were
+ZS (`-602083`, `-20.6333`), INTC (`-444334`, `-26.0487`) and DBX (`-252150`,
+`-15.5202`). The error paths held:
+`sort=best` and `period=notadate` were `400` (`unknown sort best; one of value,
+weight, gain, loss`, `period must be YYYY-MM-DD or YYYYQn`), a missing `cik` was
+`400`, an unknown `cik` and a period the fund never filed were `404`, and `limit`
+clamped to the documented default of 100 and cap of 2000. Coverage across nine
+funds ranged from 3.5911% (`0001958250`, 18 of 66 positions marked) through
+53.9267% (`0002038506`) and 66.8574% (`0002025409`) to 97.2368% (`0002032121`),
+with five funds sitting at `total: 0` and `coveragePct: null` because the lake
+holds one filing for each of them — a null is a hole in the lake, never a zero
+return.
+
+The page was then driven in headless Chromium against that server. For
+`0002038506` it read `$131.1M portfolio` over `67 positions · 2024 Q2 · 11 filings
+in the lake`, with the four figures `−$708.44K`, `−$21.4M`,
+`63 of 81 · 53.93% of value` and `$19.98M / $17.1M` — the same numbers the API
+returned — a panel each for `Portfolio value`, `Quarterly P&L`, `Money in and out`
+and `Positions opened and closed`, 16 bars (NVDA `+$571.54K +35.56%`, CEG
+`+$543.98K`, GAP `+$230.29K` down to ZS `−$602.08K −20.63%`, INTC `−$444.33K`, DBX
+`−$252.15K`), a table of 25 rows under the head
+`Ticker / Issuer / Action / Shares / Δ shares / VWAP then / VWAP now / Value /
+Weight / P&L / P&L %` with `Show 25 more` under it, and the two selects reading
+`11 / 2024-06-30` and `4 / value`. The canvases were read back pixel by pixel and
+the series were there: 1,893 teal and 4,630 red pixels in the P&L pane, 382 blue
+in the running total beneath it, 809 blue in the portfolio panel, 7,246 teal and
+10,082 red in the flows panel and 17,373 teal against 16,768 red in the opened and
+closed panel. That first read came back empty on every canvas, which turned out to
+be the tab being in the background: `lightweight-charts` draws its first frame in
+`requestAnimationFrame`, which a hidden tab never runs, and every canvas was still
+at the library's 300×150 default — bringing the tab forward repainted them at
+their real sizes (402×154, 406×182, 416×182) and the counts above are from that
+pass. Changing `sort` to `loss` put ZS at the top of the table and left the bars,
+the headline and a marker written onto the first canvas untouched, which is the
+create-once behaviour the panels rely on; changing the quarter to `2023-03-31`
+re-asked and re-rendered — `$114.72M portfolio`, `68 positions · 2023 Q1 · 11
+filings in the lake`, `+$3.48M`, `−$32.03M`, `69 of 84 · 53.19% of value`,
+`$12.58M / $15.58M` — with the lower running total, which is what that quarter's
+trough was.
+
+The branches that are not the happy path were driven too, on the same real
+dataset. `0000891943` — 794 positions, one filing — showed `794 positions · 2024 Q2
+· 1 filing in the lake`, a single quarter select with nothing to compare against, no
+sort select at all, no table, and three sentences where the canvases would be: `a
+fund needs two filings to have a change to mark`, `no priced move to value` and `no
+previous filing to compare against`, under the note explaining that what changed is
+measured between two filings. On the fixture servers a mixed `+10% / −5%` price set
+put 2,883 teal and 7,471 red pixels in the P&L pane with 376 blue under it, and a
+monotone-rising one showed only the teal side (`+$2.73M`, `+$27M`,
+`75 of 81 · 81.7%`), which is the same chart with one direction missing rather than
+a different code path. The 13F page was then re-run against the same real server
+after the picker was extracted: the search narrowed to one result, the fund moved
+the headline to `$131.1M portfolio` with 81 holdings rows, 25 quarter moves and 11
+flows rows, and selecting `2022-03-31` gave `82 changed positions · 2022 Q1`. The
+dashboard still routes four pages (`/`, `/stocks`, `/13f`, `/funds`). Offline, `go
+vet` and `gofmt` are clean, the 61 tests pass in 133.5 s, `ruff check` and `ruff
+format --check` pass, and `npm run build` writes the four pages in 0.25 s.

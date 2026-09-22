@@ -1,3 +1,4 @@
+import { ACTION_TONE, Badge } from './Badge.jsx';
 import { count, dollars, percent, signedCount, signedDollars, signedPercent, signedPoints } from './numbers.js';
 
 // The six classes conviction_scores emits, in the three tones the stylesheet
@@ -12,18 +13,6 @@ const SIGNAL_TONE = {
   MAINTAINED: 'flat',
   ROUTINE_ADJUSTMENT: 'flat',
 };
-
-// The five actions fund_quarterly_flows emits. A trim and a dump are the same
-// direction of travel, so they share a colour.
-const ACTION_TONE = { NEW: 'up', ADDED: 'up', TRIMMED: 'down', EXITED: 'down', HELD: 'flat' };
-
-function Badge({ tone, title, children }) {
-  return (
-    <span className={`badge ${tone}`} title={title}>
-      {children}
-    </span>
-  );
-}
 
 // SignalTable is the conviction table: one fund's quarter when `fund` is set,
 // the whole lake's quarter otherwise — the only difference between the two
