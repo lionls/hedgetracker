@@ -620,7 +620,12 @@ Six things the numbers mean, which the SQL file argues in full:
 `-13f-offline` builds the tables from the lake alone: the flows, the actions and
 the signals are unchanged, `estCapitalFlow`, the VWAP columns and every mark are
 `null`, so the funds page reports 0% coverage and says so on each panel, and a
-build takes a quarter of a second instead of three and a half minutes.
+build takes a quarter of a second instead of three and a half minutes. The
+holdings donut is the panel that does not change, because it reads the book and
+not the marks: the same fund reads the same `$131.1M / 67 positions` with the same
+twelve names and the same `55 others | 52.03% | $68.21M` tail offline, in 16 ms
+and 34,485 B, under a P&L panel that says no position of the quarter could be
+marked at all.
 
 ### The stocks page
 
