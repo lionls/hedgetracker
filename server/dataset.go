@@ -763,6 +763,55 @@ func (d *Dataset) SharesOutstanding(ctx context.Context, symbol, asOf string) (i
 	return int64(shares.Float64), true
 }
 
+// SharesOutstandingFor is SharesOutstanding for a whole list of companies in one
+// query, which is what a lake-wide panel needs: the crowded radar ranks a hundred
+// tickers and cannot pay a query each. The result is keyed by the symbol with its
+// share-class separator removed, which is how the two sources are reconciled —
+// the bundled CUSIP map writes BRKB where the market dataset writes BRK-B — and a
+// symbol the dataset has no count for by the date is absent from the map rather
+// than zero.
+func (d *Dataset) SharesOutstandingFor(ctx context.Context, symbols []string, asOf string) (map[string]int64, error) {
+	counts := map[string]int64{}
+	if len(symbols) == 0 {
+		return counts, nil
+	}
+	args := make([]any, 0, len(symbols)+1)
+	keys := make([]string, 0, len(symbols))
+	for _, symbol := range symbols {
+		key := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(symbol), "-", ""))
+		if key == "" {
+			continue
+		}
+		keys = append(keys, key)
+		args = append(args, key)
+	}
+	if len(keys) == 0 {
+		return counts, nil
+	}
+	args = append(args, asOf)
+	query := fmt.Sprintf(`SELECT upper(replace(symbol, '-', '')) AS key,
+			CAST(arg_max(shares_outstanding, CAST(report_date AS DATE)) AS DOUBLE)
+		FROM %s
+		WHERE upper(replace(symbol, '-', '')) IN (%s) AND CAST(report_date AS DATE) <= CAST(? AS DATE)
+		GROUP BY 1`, d.table("stock_shares_outstanding"), placeholders(len(keys)))
+	rows, err := d.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		var shares sql.NullFloat64
+		if err := rows.Scan(&key, &shares); err != nil {
+			return nil, err
+		}
+		if shares.Valid && shares.Float64 > 0 {
+			counts[key] = int64(shares.Float64)
+		}
+	}
+	return counts, rows.Err()
+}
+
 // placeholders returns the "?,?,?" of an IN list of n values; n is always at
 // least one because the specs it is built from are never empty.
 func placeholders(n int) string {

@@ -108,7 +108,14 @@ function marks(series) {
 // a 13F carries share counts, not what was paid for them.
 export default function Funds() {
   const [status, setStatus] = useState(null);
-  const [fund, setFund] = useState(null);
+  // A link from the directory or the comparison carries the CIK it wants to open:
+  // the page is served without a router, so a row click is a document load with
+  // ?cik= on it, and this is the one place that reads it. Without one the picker
+  // seeds the largest fund in the lake, as it does on every other fund page.
+  const [fund, setFund] = useState(() => {
+    const cik = new URLSearchParams(window.location.search).get('cik');
+    return cik ? { cik: cik.trim() } : null;
+  });
   const [wanted, setWanted] = useState('');
   const [sort, setSort] = useState(SORTS[0].value);
   const [payload, setPayload] = useState(null);
@@ -165,6 +172,9 @@ export default function Funds() {
 
   return (
     <div className="app">
+      {/* A fund named on the query string is this page's opening view: the picker's
+          own opening fund is the largest in the lake, and seeding it here would
+          open that one under the CIK the link asked for. */}
       <FundPicker
         page="funds"
         tagline="fund analytics"
@@ -173,6 +183,7 @@ export default function Funds() {
         onStatus={setStatus}
         version={version}
         onVersion={() => setVersion((value) => value + 1)}
+        seed={!fund}
       >
         {status && !status.priceSource ? (
           <p className="note down">

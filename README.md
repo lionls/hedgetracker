@@ -59,7 +59,10 @@ tests/                   # offline unit tests + `-m live` SEC integration tests
 server/                  # Go + DuckDB backend for the market explorer
 ├── main.go              # flags, boot-time warm, graceful shutdown
 ├── duck.go              # DuckDB DSN, proxy handling, httpfs
-├── dataset.go           # ticker index, profiles, bars, fundamentals, response caches
+├── dataset.go           # ticker index, profiles, bars, fundamentals, share counts, response caches
+├── thirteenf.go         # the 13F lake: table names, the embedded views, the build hash
+├── thirteenf.sql        # the lake's views, `//go:embed`ed and hashed into every build
+├── thirteenf_api.go     # 13F endpoints: funds, flows, owners, consensus, directory, a pair's overlap
 └── api.go               # JSON endpoints + the built frontend
 web/                     # React frontend (Vite, lightweight-charts)
 ```
@@ -469,15 +472,17 @@ visible before any of that work starts.
 
 `server/` and `web/` are a browser for those tables: a ticker search, a company
 card, a candlestick chart with volume, a second page that lists operating
-companies with their financial statements, a 13F dashboard, a fund analytics page
-and a book-flow page built on the same holdings lake. The Go process answers every
+companies with their financial statements, a 13F dashboard, a fund analytics page,
+a book-flow page, a consensus board, a fund directory and a pairwise fund
+comparison, the last six built on the same holdings lake. The Go process answers
+every
 request
 straight from the Parquet files on the Hub — no local copy of a table, no database
 file, nothing written outside DuckDB's spill directory in `/tmp` — and the React
-app is five pages with no router and no state library, because each page is a
+app is eight pages with no router and no state library, because each page is a
 handful of endpoints and a handful of pieces of state. Every page is one
-component with a `page` prop, chosen from `location.pathname`; navigation is five
-`<a href>`s that reload the bundle, which is cheaper than a router for five pages
+component with a `page` prop, chosen from `location.pathname`; navigation is eight
+`<a href>`s that reload the bundle, which is cheaper than a router for eight pages
 of a local app.
 
 | | |
@@ -560,6 +565,9 @@ Three properties of the serving path matter to a client:
 | `GET /api/13f/owners?ticker=NVDA` | `{"symbol":"NVDA","period":"2024-06-30","limit":100,"total":6,"summary":{"holders":6,"shares":574696,"valueUsd":71177309,"trackedAumUsd":2717846893,"aumPct":2.618885897631762,"outstandingShares":24598342000,"ownedPct":0.0023363200657995566,"boughtShares":3603,"soldShares":1581,"netShares":2022,"buyingFunds":1,"sellingFunds":1,"exits":0,"unpricedFunds":4},"holders":[{"cik":"0001661222","filerName":"","shares":235246,"valueUsd":29241000,"weightPct":12.3482,"action":"","deltaShares":0,"deltaWeightPct":0,"splitAdjusted":false,"buyQuarters":0,"boughtShares":0,"estCostPerShare":null,"estCostUsd":null},…]}` — the stocks page's institutional half: the funds holding one ticker, and what that cohort adds up to. `holders` is one row per fund still holding the name, ordered by the weight the position is of that fund's own book, and `total` counts what `limit` cut. `action` is what the fund's own previous filing makes of the position — `""` is not `HELD`: this quarter is that fund's first filing in the lake, so there is no previous book to have moved from — `splitAdjusted` says the share delta had a split undone, and `estCostPerShare` is the average VWAP of the quarters the fund bought in. `summary` is the cohort: its shares and filed value, that value's share of what every tracked fund reports for the quarter (`trackedAumUsd`), the net share change with a count of the funds on each side, and the cohort's shares over the company's own count. `outstandingShares`, and so `ownedPct`, is absent when the market table has no count for the symbol; `unpricedFunds` counts holders with nothing to price a basis from. `?period=` takes a date or a quarter label and defaults to the lake's newest, and the ticker is matched the way the views normalise it, so `BRK-B` finds the lake's `BRKB`. |
 | `GET /api/13f/fund?cik=2038506&period=2024-06-30&sort=value&limit=2000` | `{"cik":"0002038506","filerName":"","period":"2024-06-30","sort":"value","quarters":[…11 dates…],"series":[…11 rows…],"total":81,"limit":2000,"positions":[…81 rows…]}` — one row per filing in `series`, the cursor's quarter named by `period`, and the same row spelled out: `{"period":"2024-06-30","reportYear":2024,"reportQuarter":2,"prevPeriod":"2024-03-31","quartersBetween":1,"positions":67,"portfolioValueUsd":131104358,"movedPositions":81,"positionsWithPnl":63,"pnlUsd":-708441,"cumulativePnlUsd":-21396093,"coveredValueUsd":70700295,"coveragePct":53.9267,"newPositions":12,"addedPositions":27,"trimmedPositions":23,"exitedPositions":14,"heldPositions":5,"purchasedUsd":19978177.83,"soldUsd":17100750.04,"purchasedPositions":30,"soldPositions":29}`. Each position is the flow shape plus the mark: `{"cusip":"67066G104","ticker":"NVDA","issuer":"NVIDIA CORP","action":"TRIMMED","shares":20139,"valueUsd":2487972,"weightPct":1.8977,"prevShares":21720,"deltaShares":-1581,"deltaValueUsd":525440,"quartersBetween":1,"splitFactor":10,"splitAdjusted":true,"prevVwap":74.003,"vwap":100.3169,"pnlUsd":571538,"pnlPct":35.5579,"cumulativePnlUsd":695234,"priced":true}` — `pnlUsd` is the split-adjusted `prevShares × (vwap − prevVwap)`, so the dataset's adjusted VWAPs carry the split and our `splitFactor` carries the shares, and `cumulativePnlUsd` is the same marks summed per CUSIP over the fund's filings through `period` — the fund's own running total asked per position, `null` where none of the position's marked quarters had a price. `period` takes a date, a quarter label or `latest`, and defaults to the newest filing; `sort` is one of `value`, `weight`, `gain`, `loss` and anything else is a `400`; `limit` (default 100, capped at 2000) cuts `positions` while `total` keeps the whole count — and beside them `"holdings":{"largest":[{"cusip":"464288679","ticker":"SHV","issuer":"ISHARES TR","valueUsd":14126679,"weightPct":10.7751},…],"positions":67,"valueUsd":131104358}`, the quarter's book from `holdings_normalized`, largest first, which is the whole of what the funds page's donut draws |
 | `GET /api/13f/vwap?ticker=NVDA` | `{"ticker":"NVDA","quarters":[{"symbol":"NVDA","year":2024,"quarter":2,"tradingDays":63,"firstTradeDate":"2024-04-01","lastTradeDate":"2024-06-28","totalVolume":27164691100,"vwap":100.3169,"low":75.606,"high":140.76},…]}` — newest quarter first, up to `limit` (default 40, capped at 400), so the cap drops the oldest quarters of a long history rather than the newest |
+| `GET /api/13f/consensus?period=2024Q2&limit=25` | `{"period":"2024-06-30","limit":25,"quarters":[…11 dates…],"totals":{"accumulations":21,"liquidations":16,"netVolume":163,"crowded":1030},"newAccumulations":[{"ticker":"MU","issuer":"MICRON TECHNOLOGY INC","funds":1,"shares":17554,"valueUsd":2308878,"boughtUsd":2240938,"unpriced":0,"largestWeightPct":1.7611},…],"liquidations":[{"ticker":"GAP","issuer":"GAP INC","funds":1,"prevShares":96080,"prevValueUsd":2647004,"soldUsd":2304373,"unpriced":0},…],"netVolume":[{"ticker":"ARCC","issuer":"ARES CAPITAL CORP","funds":1,"buyers":1,"sellers":0,"netShares":111007,"netUsd":2322500,"unpriced":0},…],"crowded":[{"ticker":"PKST","issuer":"PEAKSTONE REALTY TRUST","funds":1,"shares":1203454,"valueUsd":12757000,"outstandingShares":36370700,"ownedPct":3.308855754769636},…]}` — four lake-wide lists over one quarter of every filer: the companies the most funds opened, the most funds left entirely, where the quarter's money went and where it came from, and the companies the tracked funds hold the largest share of. `period` takes a date or a quarter label and defaults to the lake's newest; `boughtUsd`, `soldUsd` and `netUsd` are `null` where the price dataset covers none of the moves and each row counts those in `unpriced`, and `outstandingShares` is absent with `ownedPct` `null` when the dataset carries no share count for that date |
+| `GET /api/13f/leaderboard?sort=turnover&limit=50` | `{"sort":"turnover","limit":50,"total":9,"period":"2024-06-30","funds":[{"cik":"0002038506","filerName":"","quarters":11,"firstPeriod":"2021-12-31","latestPeriod":"2024-06-30","latestValueUsd":131104358,"latestPositions":67,"top10Pct":44.47599999999999,"turnoverPct":14.140997462791074,"quarterPnlUsd":-708441,"quarterPnlPct":-1.0020340084861032,"yearPnlUsd":9475878,"yearPnlPct":13.402883255296176,"yearFilings":4,"threeYearPnlUsd":-21396093,"threeYearPnlPct":-30.263088718370977,"threeYearFilings":10,"coveragePct":53.9267,"status":"current","quartersSinceLatest":0},…]}` — one row per CIK in the lake, ranked by the server: `sort` is one of `aum`, `concentration`, `turnover`, `quarter`, `year`, `threeyear`, `name` and `filings`, every ranking largest first except `name`, and anything else is a `400` naming the list. `status` is `stale` with `quartersSinceLatest` when the fund's newest filing is older than the lake's, every P&L window carries the count of filings that could be marked, and a window the fund has no filings in is `null` |
+| `GET /api/13f/compare?a=2038506&b=2032121&period=2024Q2` | `{"period":"2024-06-30","limit":50,"quarters":["2024-06-30","2024-03-31"],"a":{"cik":"0002038506","filerName":"","quarters":11,"latestPeriod":"2024-06-30","positions":67,"valueUsd":131104358,"inPeriod":true},"b":{"cik":"0002032121",…,"positions":25,"valueUsd":123009266,"inPeriod":true},"overlap":{"sharedPositions":2,"unionPositions":90,"jaccardPct":2.2222222222222223,"sharedValueUsd":2614189,"aOnlyValueUsd":128490169,"bOnlyValueUsd":120395077,"sharedPctOfA":1.9939756693671464,"sharedPctOfB":2.1251968124092375},"shared":[{"cusip":"67066G104","ticker":"NVDA","issuer":"NVIDIA CORP","aShares":20139,"bShares":14483,"aValueUsd":2487972,"bValueUsd":1789285,"aWeightPct":1.8977,"bWeightPct":1.4546,"aAction":"TRIMMED","bAction":"ADDED","aDeltaShares":-1581,"bDeltaShares":3603,"aDeltaWeightPct":0.4287,"bDeltaWeightPct":0.5801,"aEstCostPerShare":33.3001,"bEstCostPerShare":100.3169},…],"contrarian":[…3 rows…],"contrarianTotal":3}` — two funds at one quarter, matched on CUSIP. `quarters` is the quarters both filed, newest first, and `period` is empty with `inPeriod` false on both sides when they share none; `shared` is the intersection, largest shared value first, and `contrarian` is the names one side is adding to while the other trims or leaves, each row carrying the buyer and each side's estimated cost basis, which is the share-weighted VWAP of the quarters that side bought in |
 | `POST /api/13f/refresh` | `202` with the status body, or `409` with it while a build is running |
 | `GET /*` | `web/dist`, falling back to `index.html` |
 
@@ -579,9 +587,13 @@ in the other direction: its two columns are two filings, and a band read from on
 response cannot disagree with the book read from another. The
 [stocks page](#the-stocks-page) adds `/owners?ticker=…`, the one 13F call a page
 of market data makes: the roster and the cohort totals are one response, so the
-badges and the table cannot disagree about which funds they are counting.
+badges and the table cannot disagree about which funds they are counting. The
+three lake-wide pages add one read each — `/consensus`, `/leaderboard` and
+`/compare?a=…&b=…` — for the same reason again: the board's four lists, the
+directory's rows and a pair's two books are each answered once, so a panel cannot
+be read on a different quarter from the panel beside it.
 
-Six things the numbers mean, which the SQL file argues in full:
+Seven things the numbers mean, which the SQL file argues in full:
 
 * **A position is a CUSIP, and a filing can repeat one.** 184 (filer, period, CUSIP)
   groups in this lake carry more than one line item — up to five — and the views
@@ -621,6 +633,16 @@ Six things the numbers mean, which the SQL file argues in full:
   is the same idea asked the other way: the share-weighted VWAP of the quarters the
   fund bought the position in, so a fund with no purchase in the lake's window has
   none to show.
+* **The lake's ownership is a share of the shares outstanding, and it is
+  long-only.** A filing states what a fund holds and never what it sold short, so
+  nothing in the lake is a short book — a `TRIMMED` or `EXITED` position is that
+  fund's own sale — and the market dataset carries no float, so the crowded radar
+  divides the tracked funds' filed shares by the company's own share count and
+  says so: a share of the shares outstanding, and of this lake's funds only, not
+  of the company's whole register. Turnover is an estimate for the same reason the
+  marks are: purchases and sales at the quarter's VWAP, halved, over the filing,
+  because a 13F reports positions and never transactions, so a purchase and a sale
+  of the same weight cancel rather than book.
 * **A missing price is a coverage number, not a failure.** The dataset has no bars
   for delisted names — `TWTR`, `ATVI` — so `priced` is `false` and the mark is
   `null`, never a zero that would read as "this position did not move".
@@ -975,6 +997,136 @@ the figure would be: `2024 Q2 is this fund's first filing in the lake, so there 
 no book to flow from`, plus the first transition the lake can draw when there is
 one.
 
+### The consensus board
+
+`/consensus` asks the lake the question `/13f` cannot: not what one fund owns, but
+what one quarter of every fund adds up to. Four lists answer it — the companies the
+most funds opened (`Top new accumulations`), the ones the most funds left entirely
+(`Top liquidations`), where the quarter's money went and came from (`Net
+institutional volume`), and the companies the tracked funds hold the largest share
+of (`Crowded trades radar`) — and below them the same conviction board the fund page
+mounts, on the same lake-wide quarters and wired to the same drill.
+
+**A panel is a slice of 25 rows, and each list says which slice it is.** The four
+lists come back from one `limit=25` call, and the *Show 25 more of each list* button
+walks the limit up for the lists that are still cut; it stops at 100 and its own
+tooltip names the reason — the crowded radar can only rank the quarter's hundred
+largest positions before it has a share count to divide by. Every panel carries the
+quarter's own totals next to the rows it drew — at 2024 Q2 the board opens on `21
+companies opened · 16 left entirely · 163 moved` with 21, 16, 25 and 25 rows of the
+quarter's 21, 16, 25 and 1,030, and the accumulation list is 21 rows because the
+quarter has 21 rather than because the read cut it. The header names the quarter and
+`fund against fund`, and the selector beside it offers all eleven the lake holds,
+newest first; the counts arrive with the payload, so the page reads `reading the
+filings…` until they do.
+
+**The crowded radar is a share of the shares outstanding, and it is not a float.**
+The market dataset carries no float column, so the denominator is the company's own
+count at that date — `SharesOutstandingFor` over `stock_shares_outstanding`, read
+once for the quarter's symbols in the market dataset's own spelling (upper case,
+no share-class dash: the lake's `BRK-B` is the dataset's `BRKB`). At 2024 Q2 the
+panel ranks `PKST` first: 1,203,454 shares of 36,370,700, `3.308855754769636%`, from
+one fund; `OBDC` follows at `0.4934%`. A row whose symbol the market dataset cannot
+count keeps a blank cell rather than a zero, and the panel is this lake's funds only
+— nine of them here, so a company two of them hold is not crowded company-wide.
+
+**A ticker is a drill, not a link.** The first cell of every board row is a button
+that mounts `InstitutionalOwnership` at the foot of the page for that symbol and
+scrolls it into view, so the board can say "one fund opened `MU`" and the same click
+can say which fund and how much. `MU` at 2024 Q2: two tracked funds, `30.85K` shares
+tracked, `0.149%` of tracked AUM, `+17,554` shares net. The panel is the `/stocks`
+one mounted whole — the drill adds no query of its own.
+
+**A row and its panel agree because they are the same query.** The crowded radar and
+`/api/13f/owners` both count filed shares against the company's own count, and at
+2024 Q2 `NVDA` answers the same on both sides — `funds 6` against `holders 6`, and
+`shares 574696`, `valueUsd 71177309`, `outstandingShares 24598342000`,
+`ownedPct 0.0023363200657995566` in the radar's row and the panel's summary alike.
+The radar is the owners query asked for the whole lake at once instead of one
+symbol, so the two cannot disagree about the numbers they share.
+
+**Layout.** At 1440×900 the five sections start at 85, 239, 380, 562 and 793 px, so
+all five headers and the first rows of every panel are on the screen, and each
+section then scrolls its own table — 152, 140, 181 and 183 px of 848, 760, 1,059 and
+1,075. That is the shell's fixed-height `.section` meeting the same way it meets the
+flow page and the funds donut, and not a property of this page: `/13f` at the same
+viewport shows 348 px of its 1,007 px holdings panel.
+
+### The fund directory
+
+`/leaderboard` is one row per CIK in the lake — nine here, every fund the build could
+file — with the reported book, its concentration, its turnover, its marks and the
+freshness of the filing they came from, ranked by the server rather than in the
+browser. The column set is the directory's: fund, AUM, positions, top-10 share,
+turnover, quarter, 1Y and 3Y P&L, the newest filing and how current it is, and the
+coverage the P&L columns rest on.
+
+**The ranking is a server-side whitelist, and the header is its control.** `aum`,
+`concentration`, `turnover`, `quarter`, `year`, `threeyear`, `name` and `filings` are
+the sorts the endpoint takes; everything else is a `400` naming them. Largest first
+is the rule for every ranking except `name`, `NULLS LAST` keeps a fund with nothing
+to rank — a single filing has no previous quarter to move from, and so no turnover
+and no P&L — at the foot of the list instead of at zero, and the header button marks
+the ranking in force with the stylesheet's arrow. Columns that cannot rank
+(`Positions`, `Latest filing`, `Coverage`) stay plain text rather than becoming
+buttons that would `400`.
+
+**A row is a link into the fund page.** The fund cell is `<a href="/funds?cik=…">`;
+the app has no router, so the click is a document load and `/funds` reads the CIK
+from the query string as its opening view. That flag is what makes the picker's own
+opening fund stay out of the way: `FundPicker` seeds the largest fund in the lake
+once per mount, which is right for `/funds` and `/13f` and wrong under a named CIK,
+so the funds page passes `seed={!fund}` and a directory row opens what it names.
+
+**Layout.** The page asks the endpoint for 50 rows and the lake holds nine, so this
+is the one of the three views the shell does not clip: at 1440×900 the table's
+590 px sit inside a 590 px section, header and last row both on the screen.
+
+### The overlap page
+
+`/overlap` puts two funds of the lake side by side at one quarter: what the two books
+share, what only one of them holds, and the positions one is buying while the other
+sells. The pair and the quarter are the page's own header — two fund selectors and a
+quarter selector over the quarters both funds filed — and every figure below them is
+the two filings' own for that quarter.
+
+**The Venn is proportional, and its lens is the shared capital.** A circle's radius is
+the square root of that side's book value, 80 px for the larger of the two, and the
+distance between the centres is found by bisecting the lens formula for
+`sharedValueUsd` at the same dollars-per-area scale, clamped to the range the two
+radii allow. The opening pair — `0002038506` at `$131,104,358` against `0002032121`
+at `$123,009,266`, `$2,614,189` shared — draws radii of 80 and 77 px with their
+centres 146 px apart, and the figures beside the drawing say the same thing in the
+other unit: `2 of 90 · 2.22% of the union | $2.61M shared | $128.49M only A |
+$120.4M only B`, which is `1.99%` of A and `2.13%` of B. The two circles are drawn
+from the payload, so a pair with nothing in common has no drawing to make.
+
+**A label is offset into its own half of the picture.** Two books that overlap almost
+entirely draw two circles in almost the same place, and a pair of labels at the
+centres would print on top of each other; each set sits half its own radius into its
+own side (capped at 40 drawing units), so the three lines — CIK, book value and the
+shared figure — stay legible whatever the two books are.
+
+**The two tables answer different questions.** *Shared high conviction* is the CUSIP
+intersection, each row carrying both sides' shares, weights and estimated basis;
+the basis is the average VWAP of the quarters that side was buying in, a price a
+share and the one figure on the page no filing carries. *Contrarian bets* is the
+positions the two funds moved in opposite directions, each row naming the buyer, and
+nothing else: a 13F is a long-only filing, so there is no short book to stand against
+a long one, and a trim or an exit is a fund selling shares it owned. `NVDA` is in
+both tables at the opening pair — one side trimmed it while the other added — which
+is the point of drawing them separately.
+
+**A quarter belongs to the pair.** The selector offers the quarters both funds filed,
+because a comparison is one quarter of two books; a fund whose book is missing a
+quarter cannot be compared across it. When the two have no quarter in common the page
+says so and draws nothing: `0000891943` filed once and `0001869685` stopped in 2023
+Q4, so the pair answers `no quarter both funds filed` with no tables and no Venn, and
+the endpoint behind it returns `period:""` with both sides `inPeriod:false` rather
+than an error. The default pair is the two smallest books in the lake, which is the
+pair most likely to share a name at all; a CUSIP both sides hold is the only join
+used, so a fund holding NVIDIA as `67066G104` matches any other that does.
+
 ### Running it
 
 ```sh
@@ -1042,9 +1194,9 @@ and compress the bundle in front of the container if that matters. Only
 
 Against the running server on 2026-09-15, over the proxy this sandbox uses (the
 `/fund` rows, the price-panel row, the `/flow` rows and the bundle row were
-re-measured on 2026-09-23 — that day also added the `/owners` row and the
-ownership panel's layout — and the 13F build row on both days; the boot rows are
-the 2026-09-22 run):
+re-measured on 2026-09-23 — that day also added the `/owners` row, the consensus,
+directory and compare rows, and the ownership panel's layout — and the 13F build
+row on both days; the boot rows are the 2026-09-22 run):
 
 | Step | Measured |
 | --- | --- |
@@ -1068,7 +1220,10 @@ the 2026-09-22 run):
 | `GET /api/13f/vwap?ticker=NVDA`, the price panel's query | 11 rows over the 2021 Q4 – 2024 Q2 window the lake covers, newest quarter first; `limit=5` keeps 2024 Q2 … 2023 Q2, so a cap cuts the oldest rows |
 | `GET /api/13f/flow?cik=2038506&period=2024-06-30`, the flow page's read | 3,586 B — 15 named rows against `previous {69, $133,597,275}` and `current {67, $131,104,358}` with the tail's 55 and 53 positions behind `others`; 8–14 ms across five reads of the same quarter, and 317 B / 6 ms for `0000891943`, whose single filing answers `"previous":null` and draws nothing |
 | `GET /api/13f/owners?ticker=NVDA`, the ownership panel's read | 1,820 B — six holders and the cohort's summary; 16–20 ms over four warm reads of it (19.5, 19.6, 17.4, 16.0 ms), and 2.01 s on the first call after a restart, which pays for the tables and the market read behind `ownedPct`. `?limit=2` cuts the roster to 833 B, and a symbol no tracked fund holds (`AA`) answers 309 B |
-| `npm run build`, the five pages | 0.22 s — 448.06 kB JS (139.39 kB gzipped), 9.46 kB CSS (2.45 kB gzipped); the donut is 2.53 kB of the JS and 0.98 kB of the CSS, the flow page is the 11.63 kB of JS the build grew by when it and its route were added, of which `Sankey.jsx` is 8,793 B minified on its own (8,793 B / 3,242 B gzipped with `bun build`, react external), and the ownership panel is the next 4.81 kB of JS — the same tree built with its mount line commented out is 443.25 kB (137.84 kB gzipped) — with the stylesheet untouched |
+| `GET /api/13f/consensus?limit=25`, the consensus board's read | 12,551 B (3,086 B gzipped), 38.2–51.4 ms over four warm reads — 87 rows over the four lists: the quarter's 21 accumulations, its 16 liquidations, and 25 each of its 163 net-volume and 1,030 crowded rows, with every panel's own total in `totals` so a slice cannot read as the quarter. One crowded row carries the company's own share count and the fraction of it the cohort holds: `MU` 17,554 shares from one fund, `PKST` 1,203,454 of 36,370,700 (`3.308855754769636%`) |
+| `GET /api/13f/leaderboard?sort=aum&limit=50`, the fund directory's read | 4,078 B (786 B gzipped), 12.5–13.7 ms — nine rows, one per CIK in the lake, each with its book, concentration, turnover, the three P&L windows and the coverage they rest on; the same nine rows come back in any of the eight orders the sort whitelist takes, and the one-filing fund carries `null` turnover and `null` P&L rather than a zero |
+| `GET /api/13f/compare?a=0002038506&b=0002032121`, the overlap page's read | 2,424 B (707 B gzipped), 39.2–69.1 ms — one quarter of two books: `sharedPositions 2` of `unionPositions 90` (`jaccardPct 2.2222`), `sharedValueUsd $2,614,189`, and the three contrarian rows behind a `contrarianTotal 3`, with both sides' shares, weights, deltas and estimated basis per CUSIP |
+| `npm run build`, the eight pages | 0.22 s — 481.08 kB JS (146.03 kB gzipped), 10.08 kB CSS (2.60 kB gzipped); the donut is 2.53 kB of the JS and 0.98 kB of the CSS, the flow page is the 11.63 kB of JS the build grew by when it and its route were added, of which `Sankey.jsx` is 8,793 B minified on its own (8,793 B / 3,242 B gzipped with `bun build`, react external), the ownership panel is the next 4.81 kB of JS — the same tree built with its mount line commented out is 443.25 kB (137.84 kB gzipped) — and the three views added on 2026-09-23 are the 33.01 kB of JS and 0.61 kB of CSS on top of that 448.06 kB, from `Consensus.jsx` (28,785 B minified on its own, 7,362 B gzipped), `Overlap.jsx` (21,738 B / 6,121 B) and `Leaderboard.jsx` (11,882 B / 3,969 B) — three files larger together than the bundle grew by, because most of what they hold is the picker, the ownership panel and the number helpers the tree already carries |
 
 ### Why it is shaped this way
 
@@ -1203,6 +1358,59 @@ prints each reason in its `.error` line under the heading, with the chart, the
 statements and the company card still drawn and no loading line left beside it.
 The layout readings are the ones in the section above; this panel was checked on
 the host, and the container image was not rebuilt for it.
+
+The three new views were checked against the same server, one read at a time and
+then on the page. The consensus board's crowded radar and the ownership panel
+count the same thing from the same table, and `NVDA` at 2024 Q2 comes back the
+same from both — `funds 6` against `holders 6`, and `shares 574696`,
+`valueUsd 71177309`, `outstandingShares 24598342000` and
+`ownedPct 0.0023363200657995566` in the radar's row and the panel's summary alike —
+so the two figures agree because they are the same aggregation over the same view
+rather than two queries that happen to match. The compare read was cross-checked
+the same way: with
+`a=0002038506&b=0000891943` at 2024 Q2 the endpoint answers `jaccardPct 3.4856`,
+`sharedPositions 29` and `sharedValueUsd 31403948`, and the page draws 29 shared
+rows with `3.49% of the union` and `$31.4M shared` from it. The failure bodies were
+read too, each
+with its own query: `consensus?period=xyz` is a `400` naming the two accepted
+forms, `leaderboard?sort=nope` a `400` naming all eight sorts, `compare?a=abc` and
+a missing `b` are `400`s, `b=9999999999` is a `404`, `period=2024Q2` normalises to
+`2024-06-30`, and a quarter the lake does not cover (`1999-12-31`) is a `200` with
+zero totals and four empty lists rather than an error. Two funds with no quarter in
+common answer `period:""` with both sides `inPeriod:false`, which is what the page
+renders its sentence from.
+
+On the pages, driven in headless Chromium at 1440×900 against the built bundle:
+`/consensus` draws five sections and 98 rows, and its quarter selector — eleven
+options, newest first — takes `2024 Q2` to `2024 Q1` with every panel following:
+`21 companies opened · 16 left entirely · 163 moved` and first rows `MU`, `GAP`,
+`ARCC`, `PKST` become `23 / 16 / 182` and `QQQ`, `JEPQ`, `QQQ`, `BNL`, which is
+exactly what the endpoint answers for `period=2024-03-31`. The ticker drill on `MU`
+mounts the ownership panel at the foot of the page and scrolls to it — two tracked
+funds, `30.85K` shares, `0.149%` of tracked AUM, `+17,554 shares` net — and *Show 25
+more of each list* takes the net-volume and crowded lists from 25 rows to 50 while
+the accumulation and liquidation lists stay at their quarter's 21 and 16.
+`/leaderboard` ranks on the server: `TURNOVER` descending puts `0002038506`'s
+`14.14%` first and leaves the five funds with no previous quarter at the foot of
+the table, `FUND` ascending comes back in CIK order with the arrow turned around,
+and `AUM` descending opens on the largest book. Its row link was followed: `/funds?
+cik=0002038506` opens the 67-position `$131.1M` book with `QUARTER P&L −$708.44K`
+and `MARKED 63 of 81 · 53.93%`, and `?cik=0002032121` opens the 25-position
+`$123.01M` book with `+$5.37M` and `97.24%`. `/overlap` opens on the two smallest
+books, draws the Venn described above and fills both tables; moving the quarter to
+`2024 Q1` leaves three shared rows and an empty contrarian panel with its own
+sentence, changing A to `0000891943` grows the intersection to 29 rows, and the
+pair with no common quarter draws nothing at all.
+
+Two defects were found this way and fixed rather than worked around. The estimated
+basis columns were being printed through `dollars()`, which is compact and rounds
+sub-cent prices to `$0`; they now use `count()`, the per-share helper the
+institutional panel already used. And `/funds?cik=…` did not open the fund it
+named: the picker seeds the lake's largest fund once per mount, which is right on
+`/funds` and `/13f` and wrong under a named CIK, so `FundPicker`'s `seed` flag is
+now `!fund` on that page — without it, a directory row for `0002032121` opened
+`0000891943`. A bare `/funds` still opens the largest book, and the two views that
+use the picker as chrome pass `seed={false}`.
 
 The image was then built and run the same way. `docker compose up -d --build
 explorer` takes 48 s here once the base images are pulled — `npm ci` 8 s, `go mod
@@ -1685,7 +1893,8 @@ a different code path. The 13F page was then re-run against the same real server
 after the picker was extracted: the search narrowed to one result, the fund moved
 the headline to `$131.1M portfolio` with 81 holdings rows, 25 quarter moves and 11
 flows rows, and selecting `2022-03-31` gave `82 changed positions · 2022 Q1`. The
-dashboard still routes five pages (`/`, `/stocks`, `/13f`, `/funds`, `/flow`).
+dashboard routes the eight pages (`/`, `/stocks`, `/13f`, `/consensus`,
+`/leaderboard`, `/overlap`, `/funds`, `/flow`).
 Offline, `go
 vet` and `gofmt` are clean, the 61 tests pass in 129.9 s, `ruff check` and `ruff
-format --check` pass, and `npm run build` writes the five pages in 0.23 s.
+format --check` pass, and `npm run build` writes the eight pages in 0.22 s.

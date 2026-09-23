@@ -13,6 +13,9 @@ package main
 //	/api/13f/fund       one fund's quarter series, its marked positions, its book
 //	/api/13f/flow       one fund's book over two filings, as the diagram's bands
 //	/api/13f/owners     the funds holding one ticker: the stocks page's ownership panel
+//	/api/13f/consensus  the lake's quarter: openings, exits, net flows, crowded positions
+//	/api/13f/leaderboard every filer with its concentration, turnover and estimated marks
+//	/api/13f/compare    two funds side by side: shared ground and contrarian positions
 //	/api/13f/refresh    rebuild the tables from the lake
 //
 // Rows are objects rather than the column arrays the price bars use: these
@@ -1237,21 +1240,856 @@ func (a *API) thirteenfOwners(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ---------------------------------------------------------------------------
+// The consensus board, the fund directory and the pairwise comparison read the
+// lake as a whole rather than one filer. They are built from the tables the fund
+// pages read and share their vocabulary: an action is one of thirteenActions, the
+// dollar estimate of a move is est_capital_flow — the split-adjusted share change
+// marked at the quarter's VWAP — and a weight is a filing's own
+// portfolio_weight_pct. A 13F is long-only and carries no float: where an
+// aggregate divides by a market figure the field names the denominator, and a
+// share of the shares outstanding is not a share of a float.
+// ---------------------------------------------------------------------------
+
+// consensusSlices is how many names each list of the consensus board names by
+// default; crowdSlices is how many of the quarter's largest positions the crowded
+// radar ranks before it has a market share count to divide by; leaderboardRows is
+// how many funds the directory lists at once; compareSlices is how many positions
+// each list of a comparison names.
+const (
+	consensusSlices = 25
+	crowdSlices     = 100
+	leaderboardRows = 50
+	compareSlices   = 50
+)
+
+// AccumulationRow is one company that opened positions in a quarter: how many
+// filers opened one, what they opened, and the largest weight any of them gave
+// it. boughtUsd is the shares opened marked at the quarter's VWAP and is null
+// when the price dataset covers none of them; unpriced says how many openings
+// that is.
+type AccumulationRow struct {
+	Ticker           string   `json:"ticker"`
+	Issuer           string   `json:"issuer"`
+	Funds            int64    `json:"funds"`
+	Shares           float64  `json:"shares"`
+	ValueUSD         float64  `json:"valueUsd"`
+	BoughtUSD        *float64 `json:"boughtUsd"`
+	Unpriced         int64    `json:"unpriced"`
+	LargestWeightPct float64  `json:"largestWeightPct"`
+}
+
+// LiquidationRow is one company a set of filers left entirely in a quarter: how
+// many filers exited, what they held in the previous filing, and what that was
+// worth then. soldUsd is the position they left marked at the quarter's VWAP —
+// the value that came out of the name over the quarter — and it is null when the
+// price dataset covers none of the exits.
+type LiquidationRow struct {
+	Ticker       string   `json:"ticker"`
+	Issuer       string   `json:"issuer"`
+	Funds        int64    `json:"funds"`
+	PrevShares   float64  `json:"prevShares"`
+	PrevValueUSD float64  `json:"prevValueUsd"`
+	SoldUSD      *float64 `json:"soldUsd"`
+	Unpriced     int64    `json:"unpriced"`
+}
+
+// NetVolumeRow is one company's flow across every filer in the quarter: the net
+// share change and what it is worth at the quarter's VWAP, positive for a net
+// buy, with the counts of the funds on each side. netUsd is null when the price
+// dataset covers none of the moves in the name.
+type NetVolumeRow struct {
+	Ticker    string   `json:"ticker"`
+	Issuer    string   `json:"issuer"`
+	Funds     int64    `json:"funds"`
+	Buyers    int64    `json:"buyers"`
+	Sellers   int64    `json:"sellers"`
+	NetShares float64  `json:"netShares"`
+	NetUSD    *float64 `json:"netUsd"`
+	Unpriced  int64    `json:"unpriced"`
+}
+
+// CrowdedRow is one company the tracked funds own a large share of. shares is
+// what the cohort filed this quarter; outstandingShares is the company's own
+// count from the market dataset at that date and ownedPct is the filed shares as
+// a percentage of it — a share of the shares outstanding, which is the only
+// denominator either source carries, not a share of a float. Both the count and
+// the share are absent when the dataset has no count for the symbol at that date,
+// and the share counts only the tracked funds, so it is what this lake sees and
+// not the company's whole register.
+type CrowdedRow struct {
+	Ticker            string   `json:"ticker"`
+	Issuer            string   `json:"issuer"`
+	Funds             int64    `json:"funds"`
+	Shares            float64  `json:"shares"`
+	ValueUSD          float64  `json:"valueUsd"`
+	OutstandingShares int64    `json:"outstandingShares,omitempty"`
+	OwnedPct          *float64 `json:"ownedPct"`
+}
+
+// crowdedTickers is the market symbols a crowded radar asks the price dataset
+// about: one per company, in the lake's own spelling.
+func crowdedTickers(rows []CrowdedRow) []string {
+	symbols := make([]string, 0, len(rows))
+	for _, row := range rows {
+		symbols = append(symbols, row.Ticker)
+	}
+	return symbols
+}
+
+// marketKey is a ticker as the market dataset keys a company: upper case and
+// without the share-class separator, which is how the two sources are
+// reconciled — the bundled CUSIP map writes BRKB where the dataset writes BRK-B.
+func marketKey(ticker string) string {
+	return strings.ReplaceAll(strings.ToUpper(strings.TrimSpace(ticker)), "-", "")
+}
+
+// lakeQuarters lists every report period in the lake, newest first, so a
+// lake-wide panel can offer the quarter selector a fund page offers. It is not
+// thirteenQuarters: that one is one filer's quarters, oldest first, which is the
+// order a series is drawn in.
+func (a *API) lakeQuarters(ctx context.Context, from string) ([]string, error) {
+	quarters := []string{}
+	err := a.thirteenRows(ctx, "SELECT DISTINCT report_period FROM "+from+" ORDER BY report_period DESC",
+		nil, func(rs *sql.Rows) error {
+			var period time.Time
+			if err := rs.Scan(&period); err != nil {
+				return err
+			}
+			quarters = append(quarters, formatPeriod(period))
+			return nil
+		})
+	return quarters, err
+}
+
+// thirteenfConsensus answers the lake's quarter in four lists: the companies the
+// most filers opened this quarter, the companies the most filers left, the
+// largest net flows in either direction, and the companies the cohort owns the
+// largest share of. The quarter is the lake's newest, because the board is a
+// snapshot of what the filers last said, and the response carries every quarter
+// the lake holds so a page can offer the same selector a fund page offers.
+func (a *API) thirteenfConsensus(w http.ResponseWriter, r *http.Request) {
+	holdings, ok := a.thirteenF.tablePath(w, thirteenHoldings)
+	if !ok {
+		return
+	}
+	signals, ok := a.thirteenF.tablePath(w, thirteenConviction)
+	if !ok {
+		return
+	}
+	limit := limitParam(r, consensusSlices, 200)
+
+	book, signalFrom := thirteenFrom(holdings), thirteenFrom(signals)
+
+	quarters, err := a.lakeQuarters(r.Context(), book)
+	if err != nil {
+		a.thirteenFailed(w, "consensus", err)
+		return
+	}
+
+	var period string
+	if raw := strings.TrimSpace(r.URL.Query().Get("period")); raw != "" && !strings.EqualFold(raw, "latest") {
+		period, ok = normalisePeriod(raw)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "period must be YYYY-MM-DD or YYYYQn")
+			return
+		}
+	} else {
+		var latest sql.NullTime
+		if err := a.thirteenCount(r.Context(),
+			"SELECT max(report_period) FROM "+book, nil, &latest); err != nil {
+			a.thirteenFailed(w, "consensus", err)
+			return
+		}
+		if latest.Valid {
+			period = formatPeriod(latest.Time)
+		}
+	}
+	// What the limit cut, per list, in one pass over the quarter's flows: the
+	// lists cap at `limit` and a panel can say how many names there were.
+	var accumulating, liquidated, moved, crowdedNames int64
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT
+			count(DISTINCT ticker) FILTER (WHERE action = 'NEW'),
+			count(DISTINCT ticker) FILTER (WHERE action = 'EXITED'),
+			count(DISTINCT ticker)
+		FROM %s WHERE report_period = ?`, signalFrom), []any{period},
+		func(rs *sql.Rows) error {
+			return rs.Scan(&accumulating, &liquidated, &moved)
+		}); err != nil {
+		a.thirteenFailed(w, "consensus", err)
+		return
+	}
+	if err := a.thirteenCount(r.Context(), fmt.Sprintf(
+		"SELECT count(DISTINCT ticker) FROM %s WHERE report_period = ?", book),
+		[]any{period}, &crowdedNames); err != nil {
+		a.thirteenFailed(w, "consensus", err)
+		return
+	}
+	totals := map[string]int64{
+		"accumulations": accumulating, "liquidations": liquidated,
+		"netVolume": moved, "crowded": crowdedNames,
+	}
+
+	// A company initiated by the largest number of distinct funds: NEW is a
+	// position the fund's previous filing did not have, so the count of openings
+	// is the count of the funds that opened one.
+	accumulations := []AccumulationRow{}
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT ticker, arg_max(issuer, value_usd),
+			count(DISTINCT cik), SUM(shares), SUM(value_usd), SUM(est_capital_flow),
+			count(*) FILTER (WHERE est_capital_flow IS NULL), MAX(portfolio_weight_pct)
+		FROM %s WHERE report_period = ? AND action = 'NEW'
+		GROUP BY ticker
+		ORDER BY count(DISTINCT cik) DESC, SUM(est_capital_flow) DESC NULLS LAST,
+			SUM(value_usd) DESC, ticker
+		LIMIT %d`, signalFrom, limit), []any{period}, func(rs *sql.Rows) error {
+		var row AccumulationRow
+		if err := rs.Scan(&row.Ticker, &row.Issuer, &row.Funds, &row.Shares, &row.ValueUSD,
+			&row.BoughtUSD, &row.Unpriced, &row.LargestWeightPct); err != nil {
+			return err
+		}
+		accumulations = append(accumulations, row)
+		return nil
+	}); err != nil {
+		a.thirteenFailed(w, "consensus", err)
+		return
+	}
+
+	// A company the largest number of distinct funds left: the previous filing's
+	// shares and value are what the exits gave up, and the sales are that position
+	// marked at this quarter's VWAP.
+	liquidations := []LiquidationRow{}
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT ticker, arg_max(issuer, prev_value_usd),
+			count(DISTINCT cik), SUM(prev_shares), SUM(prev_value_usd),
+			-SUM(est_capital_flow), count(*) FILTER (WHERE est_capital_flow IS NULL)
+		FROM %s WHERE report_period = ? AND action = 'EXITED'
+		GROUP BY ticker
+		ORDER BY count(DISTINCT cik) DESC, SUM(prev_value_usd) DESC NULLS LAST, ticker
+		LIMIT %d`, signalFrom, limit), []any{period}, func(rs *sql.Rows) error {
+		var row LiquidationRow
+		if err := rs.Scan(&row.Ticker, &row.Issuer, &row.Funds, &row.PrevShares, &row.PrevValueUSD,
+			&row.SoldUSD, &row.Unpriced); err != nil {
+			return err
+		}
+		liquidations = append(liquidations, row)
+		return nil
+	}); err != nil {
+		a.thirteenFailed(w, "consensus", err)
+		return
+	}
+
+	// The quarter's net flow per company, ranked by how much money moved either
+	// way: the sign is in the row, so the top of this list is the quarter's largest
+	// inflow and the bottom its largest outflow.
+	netVolume := []NetVolumeRow{}
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT ticker, arg_max(issuer, value_usd),
+			count(DISTINCT cik),
+			count(DISTINCT cik) FILTER (WHERE action IN ('NEW', 'ADDED')),
+			count(DISTINCT cik) FILTER (WHERE action IN ('TRIMMED', 'EXITED')),
+			SUM(delta_shares), SUM(est_capital_flow),
+			count(*) FILTER (WHERE est_capital_flow IS NULL)
+		FROM %s WHERE report_period = ?
+		GROUP BY ticker
+		ORDER BY abs(SUM(est_capital_flow)) DESC NULLS LAST, SUM(value_usd) DESC, ticker
+		LIMIT %d`, signalFrom, limit), []any{period}, func(rs *sql.Rows) error {
+		var row NetVolumeRow
+		if err := rs.Scan(&row.Ticker, &row.Issuer, &row.Funds, &row.Buyers, &row.Sellers,
+			&row.NetShares, &row.NetUSD, &row.Unpriced); err != nil {
+			return err
+		}
+		netVolume = append(netVolume, row)
+		return nil
+	}); err != nil {
+		a.thirteenFailed(w, "consensus", err)
+		return
+	}
+
+	// The crowded radar: the quarter's largest tracked positions first, because
+	// the share of the company is only known once the market dataset has been
+	// asked, and the ranking is by that share. A company the dataset cannot price
+	// a count for keeps a null share and sorts last.
+	crowded := []CrowdedRow{}
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT ticker, arg_max(issuer, value_usd),
+			count(DISTINCT cik), SUM(shares), SUM(value_usd)
+		FROM %s WHERE report_period = ?
+		GROUP BY ticker
+		ORDER BY SUM(value_usd) DESC, ticker
+		LIMIT %d`, book, crowdSlices), []any{period}, func(rs *sql.Rows) error {
+		var row CrowdedRow
+		if err := rs.Scan(&row.Ticker, &row.Issuer, &row.Funds, &row.Shares, &row.ValueUSD); err != nil {
+			return err
+		}
+		crowded = append(crowded, row)
+		return nil
+	}); err != nil {
+		a.thirteenFailed(w, "consensus", err)
+		return
+	}
+	counts, err := a.dataset.SharesOutstandingFor(r.Context(), crowdedTickers(crowded), period)
+	if err != nil {
+		// The radar's denominator comes from the market half of the app: a dataset
+		// that cannot answer leaves the column empty, as the ownership panel does,
+		// rather than failing the three lists that never left the lake.
+		log.Printf("13f consensus: share counts unavailable: %v", err)
+		counts = map[string]int64{}
+	}
+	for i := range crowded {
+		count, found := counts[marketKey(crowded[i].Ticker)]
+		if !found {
+			continue
+		}
+		crowded[i].OutstandingShares = count
+		owned := 100 * crowded[i].Shares / float64(count)
+		crowded[i].OwnedPct = &owned
+	}
+	sort.SliceStable(crowded, func(i, j int) bool {
+		left, right := crowded[i].OwnedPct, crowded[j].OwnedPct
+		switch {
+		case left == nil && right == nil:
+			return crowded[i].ValueUSD > crowded[j].ValueUSD
+		case left == nil:
+			return false
+		case right == nil:
+			return true
+		default:
+			return *left > *right
+		}
+	})
+	crowded = crowded[:min(limit, len(crowded))]
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"period": period, "limit": limit, "quarters": quarters, "totals": totals,
+		"newAccumulations": accumulations, "liquidations": liquidations,
+		"netVolume": netVolume, "crowded": crowded,
+	})
+}
+
+// leaderboardSorts are the directory's rankings, the first one being its
+// default. A null never outranks a number in either direction: an estimate the
+// price dataset could not make is a hole in the estimate, not a faultless fund.
+var leaderboardSorts = []struct{ name, order string }{
+	{"aum", "f.latest_value_usd DESC NULLS LAST, f.cik"},
+	{"concentration", "t.top10_pct DESC NULLS LAST, f.latest_value_usd DESC"},
+	{"turnover", "turnover_pct DESC NULLS LAST, f.latest_value_usd DESC"},
+	{"quarter", "quarter_pnl_pct DESC NULLS LAST, f.latest_value_usd DESC"},
+	{"year", "year_pnl_pct DESC NULLS LAST, f.latest_value_usd DESC"},
+	{"threeyear", "three_year_pnl_pct DESC NULLS LAST, f.latest_value_usd DESC"},
+	{"name", "f.filer_name ASC NULLS LAST, f.cik"},
+	{"filings", "f.quarters DESC NULLS LAST, f.cik"},
+}
+
+// LeaderboardRow is one fund in the directory: the portfolio of its newest
+// filing, how concentrated that book is, how much of it it turned over, and what
+// the marks did — the quarter's, the last four filings', and the last twelve's.
+// An estimate covers the positions the price dataset could mark, which is why
+// coveragePct rides along: quarterPnlPct is the quarter's marks against the
+// covered value rather than against the whole book, and the two aggregate
+// percentages are what those quarters added to the newest filing's covered value.
+// yearFilings and threeYearFilings count the filings in the window that could be
+// marked at all, so a fund the lake holds three filings of does not read as a
+// three-year record. A 13F files positions, never transactions, so turnoverPct is
+// the estimated one: the quarter's purchases and sales at the quarter's VWAP,
+// halved, over the filing's total. status is "current" when the fund filed the
+// lake's newest quarter and "stale" otherwise, and quartersSinceLatest counts the
+// gap between the two.
+type LeaderboardRow struct {
+	Cik                 string   `json:"cik"`
+	FilerName           string   `json:"filerName"`
+	Quarters            int64    `json:"quarters"`
+	FirstPeriod         string   `json:"firstPeriod"`
+	LatestPeriod        string   `json:"latestPeriod"`
+	LatestValueUSD      float64  `json:"latestValueUsd"`
+	LatestPositions     int64    `json:"latestPositions"`
+	Top10Pct            *float64 `json:"top10Pct"`
+	TurnoverPct         *float64 `json:"turnoverPct"`
+	QuarterPnlUSD       *float64 `json:"quarterPnlUsd"`
+	QuarterPnlPct       *float64 `json:"quarterPnlPct"`
+	YearPnlUSD          *float64 `json:"yearPnlUsd"`
+	YearPnlPct          *float64 `json:"yearPnlPct"`
+	YearFilings         int64    `json:"yearFilings"`
+	ThreeYearPnlUSD     *float64 `json:"threeYearPnlUsd"`
+	ThreeYearPnlPct     *float64 `json:"threeYearPnlPct"`
+	ThreeYearFilings    int64    `json:"threeYearFilings"`
+	CoveragePct         *float64 `json:"coveragePct"`
+	Status              string   `json:"status"`
+	QuartersSinceLatest int64    `json:"quartersSinceLatest"`
+}
+
+// thirteenfLeaderboard is the fund directory: every filer in the lake with the
+// figures a screen on funds wants, ranked by one of leaderboardSorts. The
+// estimates come from fund_quarterly_performance, whose pnl_usd is null on a
+// filing with no previous one — the first filing in the lake has nothing to mark
+// — so a window's totals are the quarters it could actually mark.
+func (a *API) thirteenfLeaderboard(w http.ResponseWriter, r *http.Request) {
+	funds, ok := a.thirteenF.tablePath(w, thirteenFunds)
+	if !ok {
+		return
+	}
+	performance, ok := a.thirteenF.tablePath(w, thirteenPerformance)
+	if !ok {
+		return
+	}
+	holdings, ok := a.thirteenF.tablePath(w, thirteenHoldings)
+	if !ok {
+		return
+	}
+	sort, order, ok := sortFrom(w, r.URL.Query().Get("sort"), leaderboardSorts)
+	if !ok {
+		return
+	}
+	limit := limitParam(r, leaderboardRows, 1000)
+
+	book, performanceFrom := thirteenFrom(holdings), thirteenFrom(performance)
+	fundFrom := thirteenFrom(funds)
+
+	// The lake's newest filing is what "current" is measured against, and it is
+	// the funds view's own latest_period rather than a date spelled here.
+	var newest sql.NullTime
+	if err := a.thirteenCount(r.Context(), "SELECT max(latest_period) FROM "+fundFrom, nil, &newest); err != nil {
+		a.thirteenFailed(w, "leaderboard", err)
+		return
+	}
+	lake := ""
+	if newest.Valid {
+		lake = formatPeriod(newest.Time)
+	}
+
+	// Two window questions the views do not answer: how much of a book its ten
+	// largest positions are, and what the trailing four and twelve filings added.
+	// The marks come from fund_quarterly_performance, one row per filing, and the
+	// windows are the filings themselves — a fund that skips a quarter has fewer
+	// rows in the window, which is what yearFilings and threeYearFilings report.
+	query := fmt.Sprintf(`WITH top10 AS (
+			SELECT cik, report_period, SUM(portfolio_weight_pct) AS top10_pct FROM (
+				SELECT cik, report_period, portfolio_weight_pct,
+					row_number() OVER (PARTITION BY cik, report_period
+						ORDER BY value_usd DESC, cusip) AS rk
+				FROM %s
+			) WHERE rk <= 10
+			GROUP BY cik, report_period
+		),
+		marks AS (
+			SELECT cik, report_period, pnl_usd, purchased_usd, sold_usd, portfolio_value_total,
+				covered_value_usd, coverage_pct,
+				SUM(pnl_usd) OVER w4 AS year_pnl_usd,
+				count(pnl_usd) OVER w4 AS year_filings,
+				SUM(pnl_usd) OVER w12 AS three_year_pnl_usd,
+				count(pnl_usd) OVER w12 AS three_year_filings
+			FROM %s
+			WINDOW
+				w4 AS (PARTITION BY cik ORDER BY report_period
+					ROWS BETWEEN 3 PRECEDING AND CURRENT ROW),
+				w12 AS (PARTITION BY cik ORDER BY report_period
+					ROWS BETWEEN 11 PRECEDING AND CURRENT ROW)
+		)
+		SELECT f.cik, COALESCE(f.filer_name, ''), f.quarters, f.first_period, f.latest_period,
+			f.latest_value_usd, f.latest_positions, t.top10_pct,
+			100.0 * (m.purchased_usd + m.sold_usd) / 2.0 / NULLIF(m.portfolio_value_total, 0)
+				AS turnover_pct,
+			m.pnl_usd, 100.0 * m.pnl_usd / NULLIF(m.covered_value_usd, 0) AS quarter_pnl_pct,
+			m.year_pnl_usd, 100.0 * m.year_pnl_usd / NULLIF(m.covered_value_usd, 0) AS year_pnl_pct,
+			COALESCE(m.year_filings, 0),
+			m.three_year_pnl_usd,
+			100.0 * m.three_year_pnl_usd / NULLIF(m.covered_value_usd, 0) AS three_year_pnl_pct,
+			COALESCE(m.three_year_filings, 0), m.coverage_pct
+		FROM %s f
+		LEFT JOIN top10 t ON t.cik = f.cik AND t.report_period = f.latest_period
+		LEFT JOIN marks m ON m.cik = f.cik AND m.report_period = f.latest_period
+		ORDER BY %s
+		LIMIT %d`, book, performanceFrom, fundFrom, order, limit)
+
+	rows := []LeaderboardRow{}
+	if err := a.thirteenRows(r.Context(), query, nil, func(rs *sql.Rows) error {
+		var row LeaderboardRow
+		var first, latest time.Time
+		if err := rs.Scan(&row.Cik, &row.FilerName, &row.Quarters, &first, &latest,
+			&row.LatestValueUSD, &row.LatestPositions, &row.Top10Pct, &row.TurnoverPct,
+			&row.QuarterPnlUSD, &row.QuarterPnlPct, &row.YearPnlUSD, &row.YearPnlPct,
+			&row.YearFilings, &row.ThreeYearPnlUSD, &row.ThreeYearPnlPct,
+			&row.ThreeYearFilings, &row.CoveragePct); err != nil {
+			return err
+		}
+		row.FirstPeriod = formatPeriod(first)
+		row.LatestPeriod = formatPeriod(latest)
+		row.QuartersSinceLatest = quartersApart(row.LatestPeriod, lake)
+		row.Status = "stale"
+		if row.LatestPeriod == lake {
+			row.Status = "current"
+		}
+		rows = append(rows, row)
+		return nil
+	}); err != nil {
+		a.thirteenFailed(w, "leaderboard", err)
+		return
+	}
+
+	total := int64(0)
+	if err := a.thirteenCount(r.Context(), "SELECT count(*) FROM "+fundFrom, nil, &total); err != nil {
+		a.thirteenFailed(w, "leaderboard", err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"sort": sort, "limit": limit, "total": total, "period": lake, "funds": rows,
+	})
+}
+
+// CompareFund is one side of a comparison: the filer's newest filing in the lake
+// and what it filed at the quarter being compared. inPeriod is false when the
+// fund filed nothing that quarter — a hand-picked quarter can be one the other
+// side skipped — so a page can tell an empty book from an unread one.
+type CompareFund struct {
+	Cik          string  `json:"cik"`
+	FilerName    string  `json:"filerName"`
+	Quarters     int64   `json:"quarters"`
+	LatestPeriod string  `json:"latestPeriod"`
+	Positions    int64   `json:"positions"`
+	ValueUSD     float64 `json:"valueUsd"`
+	InPeriod     bool    `json:"inPeriod"`
+}
+
+// CompareOverlap is the ground two books share: the positions in common, the
+// Jaccard similarity of the two books, and the capital each side holds in common
+// or alone. Positions are matched on CUSIP, which is the identity a filing uses;
+// sharedPositions counts the intersection and unionPositions the union, so
+// jaccardPct is the intersection over the union. sharedValueUsd is the sum of the
+// smaller value in each shared position — the part both funds hold — and the two
+// unique columns are each book minus that. A 13F is long-only, so what overlaps
+// is long positions: the lake holds no short book to compare.
+type CompareOverlap struct {
+	SharedPositions int64    `json:"sharedPositions"`
+	UnionPositions  int64    `json:"unionPositions"`
+	JaccardPct      float64  `json:"jaccardPct"`
+	SharedValueUSD  float64  `json:"sharedValueUsd"`
+	AOnlyValueUSD   float64  `json:"aOnlyValueUsd"`
+	BOnlyValueUSD   float64  `json:"bOnlyValueUsd"`
+	SharedPctOfA    *float64 `json:"sharedPctOfA"`
+	SharedPctOfB    *float64 `json:"sharedPctOfB"`
+}
+
+// ComparePosition is one position of a shared or a contrarian list: what each
+// side holds in the company, the weight it is of that side's own book, the move
+// each side made this quarter, and the estimated basis of each side's position —
+// the average VWAP of the quarters that fund bought the CUSIP at, the same
+// estimate the ownership panel makes, and null for a fund that only held. buyer
+// names the side that added in a contrarian row ("a" or "b") and is empty in a
+// shared one. A position one side exited has no row in the quarter's book, so its
+// shares, value and weight are zero there while the move stays in the record.
+type ComparePosition struct {
+	Cusip            string   `json:"cusip"`
+	Ticker           string   `json:"ticker"`
+	Issuer           string   `json:"issuer"`
+	AShares          float64  `json:"aShares"`
+	BShares          float64  `json:"bShares"`
+	AValueUSD        float64  `json:"aValueUsd"`
+	BValueUSD        float64  `json:"bValueUsd"`
+	AWeightPct       float64  `json:"aWeightPct"`
+	BWeightPct       float64  `json:"bWeightPct"`
+	AAction          string   `json:"aAction"`
+	BAction          string   `json:"bAction"`
+	ADeltaShares     float64  `json:"aDeltaShares"`
+	BDeltaShares     float64  `json:"bDeltaShares"`
+	ADeltaWeightPct  float64  `json:"aDeltaWeightPct"`
+	BDeltaWeightPct  float64  `json:"bDeltaWeightPct"`
+	AEstCostPerShare *float64 `json:"aEstCostPerShare"`
+	BEstCostPerShare *float64 `json:"bEstCostPerShare"`
+	Buyer            string   `json:"buyer,omitempty"`
+}
+
+// thirteenfCompare answers one quarter of two funds side by side: what each filed,
+// the ground the two books share, the positions in common with each side's weight
+// and estimated basis, and the positions one side is buying while the other sells.
+// The quarter defaults to the newest both funds filed, and the response carries
+// every quarter they both filed so a page can offer a selector; a pair with no
+// quarter in common answers with no period and empty lists.
+//
+// "Buying" and "selling" are the filing's own actions: an action is NEW, ADDED,
+// TRIMMED, EXITED or HELD. There is no short side to compare, because a 13F
+// reports long positions only.
+func (a *API) thirteenfCompare(w http.ResponseWriter, r *http.Request) {
+	holdings, ok := a.thirteenF.tablePath(w, thirteenHoldings)
+	if !ok {
+		return
+	}
+	flows, ok := a.thirteenF.tablePath(w, thirteenFlows)
+	if !ok {
+		return
+	}
+	pnl, ok := a.thirteenF.tablePath(w, thirteenPositionPnl)
+	if !ok {
+		return
+	}
+	funds, ok := a.thirteenF.tablePath(w, thirteenFunds)
+	if !ok {
+		return
+	}
+	aCik, okA := cikNamedParam(w, r, "a")
+	if !okA {
+		return
+	}
+	bCik, okB := cikNamedParam(w, r, "b")
+	if !okB {
+		return
+	}
+	limit := limitParam(r, compareSlices, 500)
+
+	book, flowFrom, pnlFrom := thirteenFrom(holdings), thirteenFrom(flows), thirteenFrom(pnl)
+
+	sides := map[string]*CompareFund{}
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(
+		"SELECT cik, COALESCE(filer_name, ''), quarters, latest_period FROM %s WHERE cik IN (?, ?)",
+		thirteenFrom(funds)), []any{aCik, bCik}, func(rs *sql.Rows) error {
+		var latest time.Time
+		side := CompareFund{}
+		if err := rs.Scan(&side.Cik, &side.FilerName, &side.Quarters, &latest); err != nil {
+			return err
+		}
+		side.LatestPeriod = formatPeriod(latest)
+		sides[side.Cik] = &side
+		return nil
+	}); err != nil {
+		a.thirteenFailed(w, "compare", err)
+		return
+	}
+	for _, cik := range []string{aCik, bCik} {
+		if _, found := sides[cik]; !found {
+			writeError(w, http.StatusNotFound, "no fund "+cik+" in the lake")
+			return
+		}
+	}
+
+	// The quarters both funds filed, newest first: the comparison is of one
+	// quarter, and a quarter only one of them filed is not a comparison.
+	quarters := []string{}
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT DISTINCT a.report_period
+		FROM %s a JOIN %s b ON b.report_period = a.report_period
+		WHERE a.cik = ? AND b.cik = ?
+		ORDER BY a.report_period DESC`, book, book), []any{aCik, bCik},
+		func(rs *sql.Rows) error {
+			var period time.Time
+			if err := rs.Scan(&period); err != nil {
+				return err
+			}
+			quarters = append(quarters, formatPeriod(period))
+			return nil
+		}); err != nil {
+		a.thirteenFailed(w, "compare", err)
+		return
+	}
+
+	var period string
+	if raw := strings.TrimSpace(r.URL.Query().Get("period")); raw != "" && !strings.EqualFold(raw, "latest") {
+		period, ok = normalisePeriod(raw)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "period must be YYYY-MM-DD or YYYYQn")
+			return
+		}
+	} else if len(quarters) > 0 {
+		period = quarters[0]
+	}
+	// A pair that shares no quarter has no quarter to compare, and the queries
+	// below bind the period as a date — which an empty string is not.
+	if period == "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"period": "", "limit": limit, "quarters": quarters,
+			"a": sides[aCik], "b": sides[bCik], "overlap": CompareOverlap{},
+			"shared": []ComparePosition{}, "contrarian": []ComparePosition{}, "contrarianTotal": 0,
+		})
+		return
+	}
+
+	// What each side filed at the quarter, and the overlap of the two books: the
+	// intersection and the union are counted on CUSIP, the identity a filing uses,
+	// and the shared capital is the sum of the smaller value in each shared
+	// position. The cost-basis aggregate is the average VWAP of the quarters a fund
+	// bought a CUSIP at, matched per fund and CUSIP because the two sides have
+	// their own basis in the same company.
+	basis := fmt.Sprintf(`SELECT cik, cusip,
+			ROUND(SUM(delta_shares * cur_vwap) / NULLIF(SUM(delta_shares), 0), 4)
+				AS est_cost_per_share
+		FROM %s
+		WHERE cik IN (?, ?) AND report_period <= ? AND action IN ('NEW', 'ADDED')
+			AND cur_vwap IS NOT NULL
+		GROUP BY cik, cusip`, pnlFrom)
+
+	totals := struct {
+		APositions, BPositions, SharedPositions, UnionPositions int64
+		SharedValue, AValue, BValue                             float64
+	}{}
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`WITH a AS (
+			SELECT cusip, value_usd FROM %s WHERE cik = ? AND report_period = ?
+		), b AS (
+			SELECT cusip, value_usd FROM %s WHERE cik = ? AND report_period = ?
+		), shared AS (
+			SELECT a.cusip, LEAST(a.value_usd, b.value_usd) AS value FROM a JOIN b USING (cusip)
+		)
+		SELECT (SELECT count(*) FROM a), (SELECT count(*) FROM b), (SELECT count(*) FROM shared),
+			(SELECT count(*) FROM (SELECT cusip FROM a UNION SELECT cusip FROM b)),
+			(SELECT COALESCE(SUM(value), 0) FROM shared),
+			(SELECT COALESCE(SUM(value_usd), 0) FROM a),
+			(SELECT COALESCE(SUM(value_usd), 0) FROM b)`, book, book),
+		[]any{aCik, period, bCik, period}, func(rs *sql.Rows) error {
+			return rs.Scan(&totals.APositions, &totals.BPositions, &totals.SharedPositions,
+				&totals.UnionPositions, &totals.SharedValue, &totals.AValue, &totals.BValue)
+		}); err != nil {
+		a.thirteenFailed(w, "compare", err)
+		return
+	}
+	overlap := CompareOverlap{
+		SharedPositions: totals.SharedPositions,
+		UnionPositions:  totals.UnionPositions,
+		SharedValueUSD:  totals.SharedValue,
+		AOnlyValueUSD:   totals.AValue - totals.SharedValue,
+		BOnlyValueUSD:   totals.BValue - totals.SharedValue,
+	}
+	if totals.UnionPositions > 0 {
+		overlap.JaccardPct = 100 * float64(totals.SharedPositions) / float64(totals.UnionPositions)
+	}
+	if totals.AValue > 0 {
+		share := 100 * totals.SharedValue / totals.AValue
+		overlap.SharedPctOfA = &share
+	}
+	if totals.BValue > 0 {
+		share := 100 * totals.SharedValue / totals.BValue
+		overlap.SharedPctOfB = &share
+	}
+	for _, side := range []*CompareFund{sides[aCik], sides[bCik]} {
+		if side.Cik == aCik {
+			side.Positions, side.ValueUSD = totals.APositions, totals.AValue
+		} else {
+			side.Positions, side.ValueUSD = totals.BPositions, totals.BValue
+		}
+		side.InPeriod = side.Positions > 0
+	}
+
+	// The positions in common, ranked by the weight the position carries for
+	// whichever fund holds more of it: a name is high conviction if it is a large
+	// part of either book.
+	shared := []ComparePosition{}
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT a.cusip, a.ticker, a.issuer,
+			a.shares, b.shares, a.value_usd, b.value_usd,
+			a.portfolio_weight_pct, b.portfolio_weight_pct,
+			COALESCE(fa.action, ''), COALESCE(fb.action, ''),
+			COALESCE(fa.delta_shares, 0), COALESCE(fb.delta_shares, 0),
+			COALESCE(fa.delta_weight_pct, 0), COALESCE(fb.delta_weight_pct, 0),
+			pa.est_cost_per_share, pb.est_cost_per_share
+		FROM %s a
+		JOIN %s b ON b.cusip = a.cusip AND b.report_period = a.report_period
+		LEFT JOIN %s fa ON fa.cik = a.cik AND fa.report_period = a.report_period AND fa.cusip = a.cusip
+		LEFT JOIN %s fb ON fb.cik = b.cik AND fb.report_period = b.report_period AND fb.cusip = b.cusip
+		LEFT JOIN (%s) pa ON pa.cik = a.cik AND pa.cusip = a.cusip
+		LEFT JOIN (%s) pb ON pb.cik = b.cik AND pb.cusip = b.cusip
+		WHERE a.cik = ? AND b.cik = ? AND a.report_period = ? AND b.report_period = ?
+		ORDER BY GREATEST(a.portfolio_weight_pct, b.portfolio_weight_pct) DESC,
+			a.value_usd + b.value_usd DESC, a.cusip
+		LIMIT %d`, book, book, flowFrom, flowFrom, basis, basis, limit),
+		[]any{aCik, bCik, period, aCik, bCik, period, aCik, bCik, period, period},
+		func(rs *sql.Rows) error {
+			row, err := scanCompare(rs)
+			if err != nil {
+				return err
+			}
+			shared = append(shared, row)
+			return nil
+		}); err != nil {
+		a.thirteenFailed(w, "compare", err)
+		return
+	}
+
+	// The contrarian pairs: one side opened or added to a position the other
+	// trimmed or left. Ranked by how much of a book each side moved, so the pair
+	// both funds feel strongest comes first.
+	contrarian := []ComparePosition{}
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT fa.cusip, COALESCE(a.ticker, fa.ticker),
+			COALESCE(a.issuer, fa.issuer),
+			COALESCE(a.shares, 0), COALESCE(b.shares, 0),
+			COALESCE(a.value_usd, 0), COALESCE(b.value_usd, 0),
+			COALESCE(a.portfolio_weight_pct, 0), COALESCE(b.portfolio_weight_pct, 0),
+			fa.action, fb.action,
+			COALESCE(fa.delta_shares, 0), COALESCE(fb.delta_shares, 0),
+			COALESCE(fa.delta_weight_pct, 0), COALESCE(fb.delta_weight_pct, 0),
+			pa.est_cost_per_share, pb.est_cost_per_share
+		FROM %s fa
+		JOIN %s fb ON fb.cusip = fa.cusip AND fb.report_period = fa.report_period
+		LEFT JOIN %s a ON a.cik = fa.cik AND a.report_period = fa.report_period AND a.cusip = fa.cusip
+		LEFT JOIN %s b ON b.cik = fb.cik AND b.report_period = fb.report_period AND b.cusip = fb.cusip
+		LEFT JOIN (%s) pa ON pa.cik = fa.cik AND pa.cusip = fa.cusip
+		LEFT JOIN (%s) pb ON pb.cik = fb.cik AND pb.cusip = fb.cusip
+		WHERE fa.cik = ? AND fb.cik = ? AND fa.report_period = ?
+			AND ((fa.action IN ('NEW', 'ADDED') AND fb.action IN ('TRIMMED', 'EXITED'))
+				OR (fb.action IN ('NEW', 'ADDED') AND fa.action IN ('TRIMMED', 'EXITED')))
+		ORDER BY abs(COALESCE(fa.delta_weight_pct, 0)) + abs(COALESCE(fb.delta_weight_pct, 0)) DESC,
+			fa.cusip
+		LIMIT %d`, flowFrom, flowFrom, book, book, basis, basis, limit),
+		[]any{aCik, bCik, period, aCik, bCik, period, aCik, bCik, period, period},
+		func(rs *sql.Rows) error {
+			row, err := scanCompare(rs)
+			if err != nil {
+				return err
+			}
+			// The buyer is the side that added: A opened or added to what B left.
+			row.Buyer = "a"
+			if row.AAction == "TRIMMED" || row.AAction == "EXITED" {
+				row.Buyer = "b"
+			}
+			contrarian = append(contrarian, row)
+			return nil
+		}); err != nil {
+		a.thirteenFailed(w, "compare", err)
+		return
+	}
+
+	contrarianTotal := int64(0)
+	if err := a.thirteenCount(r.Context(), fmt.Sprintf(`SELECT count(*)
+		FROM %s fa
+		JOIN %s fb ON fb.cusip = fa.cusip AND fb.report_period = fa.report_period
+		WHERE fa.cik = ? AND fb.cik = ? AND fa.report_period = ?
+			AND ((fa.action IN ('NEW', 'ADDED') AND fb.action IN ('TRIMMED', 'EXITED'))
+				OR (fb.action IN ('NEW', 'ADDED') AND fa.action IN ('TRIMMED', 'EXITED')))`,
+		flowFrom, flowFrom), []any{aCik, bCik, period}, &contrarianTotal); err != nil {
+		a.thirteenFailed(w, "compare", err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"period": period, "limit": limit, "quarters": quarters,
+		"a": sides[aCik], "b": sides[bCik], "overlap": overlap,
+		"shared": shared, "contrarian": contrarian, "contrarianTotal": contrarianTotal,
+	})
+}
+
+// scanCompare reads one row of the shared and contrarian lists, which select the
+// same columns in the same order.
+func scanCompare(rs *sql.Rows) (ComparePosition, error) {
+	row := ComparePosition{}
+	err := rs.Scan(&row.Cusip, &row.Ticker, &row.Issuer, &row.AShares, &row.BShares,
+		&row.AValueUSD, &row.BValueUSD, &row.AWeightPct, &row.BWeightPct,
+		&row.AAction, &row.BAction, &row.ADeltaShares, &row.BDeltaShares,
+		&row.ADeltaWeightPct, &row.BDeltaWeightPct,
+		&row.AEstCostPerShare, &row.BEstCostPerShare)
+	return row, err
+}
+
 // sortOrder resolves one of the rankings a list endpoint offers, returning both
 // the name it matched and the ORDER BY that answers it, so the response can echo
 // which ranking produced the rows.
 func sortOrder(w http.ResponseWriter, raw string) (string, string, bool) {
+	return sortFrom(w, raw, thirteenSorts)
+}
+
+// sortFrom is sortOrder against the rankings of any list endpoint, so each one
+// keeps its own names and the response can echo the one it matched.
+func sortFrom(w http.ResponseWriter, raw string, sorts []struct{ name, order string }) (string, string, bool) {
 	name := strings.ToLower(strings.TrimSpace(raw))
 	if name == "" {
-		name = thirteenSorts[0].name
+		name = sorts[0].name
 	}
-	for _, sort := range thirteenSorts {
+	for _, sort := range sorts {
 		if sort.name == name {
 			return sort.name, sort.order, true
 		}
 	}
-	allowed := make([]string, 0, len(thirteenSorts))
-	for _, sort := range thirteenSorts {
+	allowed := make([]string, 0, len(sorts))
+	for _, sort := range sorts {
 		allowed = append(allowed, sort.name)
 	}
 	writeError(w, http.StatusBadRequest, "unknown sort "+name+"; one of "+strings.Join(allowed, ", "))
@@ -1353,9 +2191,15 @@ func normaliseCik(raw string) (string, bool) {
 
 // cikParam reads and normalises the filer of a request.
 func cikParam(w http.ResponseWriter, r *http.Request) (string, bool) {
-	cik, ok := normaliseCik(strings.TrimSpace(r.URL.Query().Get("cik")))
+	return cikNamedParam(w, r, "cik")
+}
+
+// cikNamedParam is cikParam for a query parameter that is not called cik, which
+// is what a two-fund comparison needs for its two sides.
+func cikNamedParam(w http.ResponseWriter, r *http.Request, name string) (string, bool) {
+	cik, ok := normaliseCik(strings.TrimSpace(r.URL.Query().Get(name)))
 	if !ok {
-		writeError(w, http.StatusBadRequest, "cik is required and must be 1-10 digits")
+		writeError(w, http.StatusBadRequest, name+" is required and must be 1-10 digits")
 		return "", false
 	}
 	return cik, true

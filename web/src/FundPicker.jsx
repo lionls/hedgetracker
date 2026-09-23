@@ -17,6 +17,7 @@ export default function FundPicker({
   onStatus,
   version,
   onVersion,
+  seed = true,
   children,
 }) {
   const [status, setStatus] = useState(null);
@@ -25,7 +26,10 @@ export default function FundPicker({
   const [failure, setFailure] = useState('');
   const [busy, setBusy] = useState(false);
   const wasBuilding = useRef(false);
-  const seeded = useRef(false);
+  // A page that only uses the sidebar as a directory passes seed={false}: picking
+  // a fund there leaves the page instead of opening it here, so the opening view
+  // is not the largest fund but no fund at all.
+  const seeded = useRef(!seed);
   const cik = fund?.cik || '';
   const building = status?.state === 'building';
 

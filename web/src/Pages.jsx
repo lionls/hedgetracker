@@ -5,6 +5,9 @@ const PAGES = [
   { page: 'explorer', path: '/', label: 'Explorer' },
   { page: 'stocks', path: '/stocks', label: 'Stocks' },
   { page: '13f', path: '/13f', label: '13F' },
+  { page: 'consensus', path: '/consensus', label: 'Consensus' },
+  { page: 'leaderboard', path: '/leaderboard', label: 'Leaderboard' },
+  { page: 'overlap', path: '/overlap', label: 'Overlap' },
   { page: 'funds', path: '/funds', label: 'Funds' },
   { page: 'flow', path: '/flow', label: 'Flow' },
 ];
