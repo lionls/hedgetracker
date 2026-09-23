@@ -137,25 +137,32 @@ type FundSeriesRow struct {
 // FundPositionRow is one position of one filing with the P&L the marks imply.
 // priced is false — and the P&L null — when the ticker has no VWAP for one of
 // the two quarters, which is a hole in the estimate rather than a flat quarter.
+// CumulativePnlUsd is the same marks summed per CUSIP over the fund's filings
+// through this quarter — the series row's cumulativePnlUsd asked of one position.
+// It is null when none of the position's quarters could be marked, and it is this
+// quarter's own mark, 0, for a name the fund first held in this quarter. The sum
+// is per CUSIP, not per holding: a name the fund sold and later bought back
+// carries the earlier spell too.
 type FundPositionRow struct {
-	Cusip           string   `json:"cusip"`
-	Ticker          string   `json:"ticker"`
-	Issuer          string   `json:"issuer"`
-	Action          string   `json:"action"`
-	Shares          float64  `json:"shares"`
-	ValueUSD        float64  `json:"valueUsd"`
-	WeightPct       float64  `json:"weightPct"`
-	PrevShares      float64  `json:"prevShares"`
-	DeltaShares     float64  `json:"deltaShares"`
-	DeltaValueUSD   float64  `json:"deltaValueUsd"`
-	QuartersBetween int64    `json:"quartersBetween"`
-	SplitFactor     float64  `json:"splitFactor"`
-	SplitAdjusted   bool     `json:"splitAdjusted"`
-	PrevVWAP        *float64 `json:"prevVwap"`
-	VWAP            *float64 `json:"vwap"`
-	PnlUSD          *float64 `json:"pnlUsd"`
-	PnlPct          *float64 `json:"pnlPct"`
-	Priced          bool     `json:"priced"`
+	Cusip            string   `json:"cusip"`
+	Ticker           string   `json:"ticker"`
+	Issuer           string   `json:"issuer"`
+	Action           string   `json:"action"`
+	Shares           float64  `json:"shares"`
+	ValueUSD         float64  `json:"valueUsd"`
+	WeightPct        float64  `json:"weightPct"`
+	PrevShares       float64  `json:"prevShares"`
+	DeltaShares      float64  `json:"deltaShares"`
+	DeltaValueUSD    float64  `json:"deltaValueUsd"`
+	QuartersBetween  int64    `json:"quartersBetween"`
+	SplitFactor      float64  `json:"splitFactor"`
+	SplitAdjusted    bool     `json:"splitAdjusted"`
+	PrevVWAP         *float64 `json:"prevVwap"`
+	VWAP             *float64 `json:"vwap"`
+	PnlUSD           *float64 `json:"pnlUsd"`
+	PnlPct           *float64 `json:"pnlPct"`
+	CumulativePnlUSD *float64 `json:"cumulativePnlUsd"`
+	Priced           bool     `json:"priced"`
 }
 
 var (
@@ -546,10 +553,12 @@ var thirteenSorts = []struct{ name, order string }{
 
 // thirteenfFund is one fund's page in one request: the quarter series from
 // fund_quarterly_performance, and the positions of one quarter from
-// position_quarter_pnl with the P&L the quarterly VWAPs imply. The series is
-// every filing the fund is in the lake for — the charts are the page — while the
-// positions answer for the quarter the request names, newest by default. A filer
-// whose first filing is the requested one has an empty positions list and a
+// position_quarter_pnl with the P&L the quarterly VWAPs imply — each of those
+// rows carrying the same marks summed per CUSIP through that quarter, so it can
+// say what the position has done, not only what it did this quarter. The series
+// is every filing the fund is in the lake for — the charts are the page — while
+// the positions answer for the quarter the request names, newest by default. A
+// filer whose first filing is the requested one has an empty positions list and a
 // series that still states what the filing was worth.
 func (a *API) thirteenfFund(w http.ResponseWriter, r *http.Request) {
 	path, ok := a.thirteenF.tablePath(w, thirteenPositionPnl)
@@ -625,17 +634,31 @@ func (a *API) thirteenfFund(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	positionsQuery := fmt.Sprintf(`SELECT cusip, ticker, issuer, action, shares, value_usd,
-			portfolio_weight_pct, prev_shares, delta_shares, delta_value_usd, quarters_between,
-			split_factor, split_adjusted, prev_vwap, cur_vwap, pnl_usd, pnl_pct, priced
-		FROM %s WHERE cik = ? AND report_period = ? ORDER BY %s LIMIT %d`, from, order, limit)
+	// The quarter's marks, and beside them the same marks summed per CUSIP over
+	// the fund's filings through this quarter — the fund's own cumulativePnlUsd
+	// asked per position. A grouped aggregate and not a window, because the group
+	// is this one fund's positions: a window over every fund's marks is the state
+	// the build's memory limit rules out. The subquery renames its key so the
+	// ranking below can go on naming bare columns.
+	positionsQuery := fmt.Sprintf(`SELECT p.cusip, p.ticker, p.issuer, p.action, p.shares, p.value_usd,
+			p.portfolio_weight_pct, p.prev_shares, p.delta_shares, p.delta_value_usd, p.quarters_between,
+			p.split_factor, p.split_adjusted, p.prev_vwap, p.cur_vwap, p.pnl_usd, p.pnl_pct, p.priced,
+			cumulative.cumulative_pnl_usd
+		FROM %s p
+		LEFT JOIN (
+			SELECT cusip AS position_cusip, SUM(pnl_usd) AS cumulative_pnl_usd
+			FROM %s WHERE cik = ? AND report_period <= ?
+			GROUP BY cusip
+		) cumulative ON cumulative.position_cusip = p.cusip
+		WHERE p.cik = ? AND p.report_period = ?
+		ORDER BY %s LIMIT %d`, from, from, order, limit)
 	positions := []FundPositionRow{}
-	if err := a.thirteenRows(r.Context(), positionsQuery, []any{cik, period}, func(rs *sql.Rows) error {
+	if err := a.thirteenRows(r.Context(), positionsQuery, []any{cik, period, cik, period}, func(rs *sql.Rows) error {
 		var row FundPositionRow
 		if err := rs.Scan(&row.Cusip, &row.Ticker, &row.Issuer, &row.Action, &row.Shares, &row.ValueUSD,
 			&row.WeightPct, &row.PrevShares, &row.DeltaShares, &row.DeltaValueUSD, &row.QuartersBetween,
 			&row.SplitFactor, &row.SplitAdjusted, &row.PrevVWAP, &row.VWAP, &row.PnlUSD, &row.PnlPct,
-			&row.Priced); err != nil {
+			&row.Priced, &row.CumulativePnlUSD); err != nil {
 			return err
 		}
 		positions = append(positions, row)
