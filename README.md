@@ -517,7 +517,7 @@ the quarterly VWAP that turns a share change into an estimated capital flow.
 | `market_quarterly_vwap` | per ticker and quarter: trading days, first and last trade date, volume-weighted close, low and high |
 | `fund_quarterly_flows` | one row per position a fund changed between consecutive *filings*, with split-adjusted deltas and an action — NEW, ADDED, TRIMMED, EXITED or HELD |
 | `conviction_scores` | the flows joined to the VWAP: `estCapitalFlow`, and a signal — HIGH_CONVICTION_BUY, STANDARD_BUY, PASSIVE_REBALANCE, CONVICTION_DUMP, MAINTAINED or ROUTINE_ADJUSTMENT |
-| `position_quarter_pnl` | one row per position of a fund-quarter that has a previous filing: the split-adjusted mark `pnl_usd` = `prev_shares × (vwap_now − vwap_prev)` and its percentage, the cumulative mark over the fund's filings so far, and a `priced` flag |
+| `position_quarter_pnl` | one row per position of a fund-quarter that has a previous filing: the split-adjusted mark `pnl_usd` = `prev_shares × (vwap_now − vwap_prev)`, its percentage against the previous mark, and a `priced` flag |
 | `fund_quarterly_performance` | one row per fund-quarter: positions, portfolio value, how many positions moved and how many could be marked, that quarter's `pnl_usd`, the cumulative one, the covered value with its coverage percentage, and the bought/sold totals |
 
 Three properties of the serving path matter to a client:
@@ -720,6 +720,17 @@ The positions are ordered and cut server-side, because that is what makes the
 table a page of 25 of 81 in the order that was asked for, so a quarter or a sort
 is a request; the charts never depend on it, and they redraw the same `series`
 either way.
+
+**The running total is the fund's, not a position's.** The `Cumulative` figure and
+the line under the bars are `cumulativePnlUsd`: one number per filing, because the
+window behind it (`SUM(pnl_usd) OVER (PARTITION BY cik ORDER BY report_period)`)
+keeps a state the size of the fund's filing count rather than of its positions.
+Marking a CUSIP across a fund's filings is a second, different sum, and it is why
+the table is the selected quarter's marks: `/fund` reads `position_quarter_pnl` for
+the period the request names, so a running total per position is not served. The
+cheap form of that sum is a `GROUP BY cusip` over the fund's filings rather than a
+window over the whole mark table, which on a real lake is the aggregate the build's
+memory limit rules out — see the header of `server/thirteenf.sql`.
 
 **Charts are created once and fed afterwards.** `lightweight-charts` wants its
 canvas mounted before it is given a series, so each panel builds its chart on mount
