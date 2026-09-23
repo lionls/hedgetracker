@@ -11,6 +11,7 @@ package main
 //	/api/13f/signals    conviction_scores, across funds, one ticker, or one fund
 //	/api/13f/vwap       market_quarterly_vwap for one ticker
 //	/api/13f/fund       one fund's quarter series, its marked positions, its book
+//	/api/13f/flow       one fund's book over two filings, as the diagram's bands
 //	/api/13f/refresh    rebuild the tables from the lake
 //
 // Rows are objects rather than the column arrays the price bars use: these
@@ -24,6 +25,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -194,6 +196,54 @@ type FundHoldings struct {
 	Largest   []FundHoldingRow `json:"largest"`
 	Positions int64            `json:"positions"`
 	ValueUSD  float64          `json:"valueUsd"`
+}
+
+// flowSlices is how many positions each side of the flow diagram names: the
+// largest by reported value at the previous filing and the largest at this one.
+// It is a union and not one ranking, because the position that was the fourth
+// largest last quarter and is the fortieth now is the trim the diagram exists to
+// show. Everything outside the union is one aggregate band per side.
+const flowSlices = 12
+
+// FlowBand is one position over the two filings the diagram draws: what it was
+// worth on each side, and the trade the flow view measured between them. The two
+// values are as reported, so each side's bands add up to that filing's book;
+// estFlowUsd is what keeps the difference between them from being read as a trade
+// when it was the market. It is null when the ticker has no daily bars, which is
+// the one case the split below cannot be made — the page falls back to the action,
+// which comes from the shares and not from a price.
+type FlowBand struct {
+	Cusip         string   `json:"cusip"`
+	Ticker        string   `json:"ticker"`
+	Issuer        string   `json:"issuer"`
+	Action        string   `json:"action"`
+	PrevValueUSD  float64  `json:"prevValueUsd"`
+	ValueUSD      float64  `json:"valueUsd"`
+	PrevWeightPct float64  `json:"prevWeightPct"`
+	WeightPct     float64  `json:"weightPct"`
+	EstFlowUSD    *float64 `json:"estFlowUsd"`
+	SplitAdjusted bool     `json:"splitAdjusted"`
+}
+
+// FlowBook is one side of the diagram: a filing's own count and value, read from
+// the book view rather than summed over the bands, so the ends of the picture are
+// the same numbers the funds page states.
+type FlowBook struct {
+	Positions int64   `json:"positions"`
+	ValueUSD  float64 `json:"valueUsd"`
+}
+
+// FlowOthers is every position the diagram does not name, both sides at once, with
+// the trades those rows measured and how many of them have no price bars. The page
+// draws it as one band with the same carried/bought/sold/market split as a named
+// position, so the arithmetic of the tail is the arithmetic of the picture.
+type FlowOthers struct {
+	PrevPositions int64    `json:"prevPositions"`
+	Positions     int64    `json:"positions"`
+	PrevValueUSD  float64  `json:"prevValueUsd"`
+	ValueUSD      float64  `json:"valueUsd"`
+	EstFlowUSD    *float64 `json:"estFlowUsd"`
+	Unpriced      int64    `json:"unpriced"`
 }
 
 var (
@@ -763,6 +813,194 @@ func (a *API) thirteenfFund(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// thirteenfFlow is one fund's book over two filings, shaped for the flow diagram:
+// the ends' own counts and values, the positions that moved either book, and one
+// aggregate for the rest. The left side is the previous filing in the lake and the
+// right side the requested quarter — the same pair position_quarter_pnl marks, so
+// the diagram and the P&L panel answer for the same two filings — and the quarter
+// is any the fund filed, so a reader can walk the whole series one transition at a
+// time. A filer whose first filing is the requested one has no previous book: the
+// response says so with a null `previous` and no bands, rather than drawing a book
+// against a zero.
+func (a *API) thirteenfFlow(w http.ResponseWriter, r *http.Request) {
+	scores, ok := a.thirteenF.tablePath(w, thirteenConviction)
+	if !ok {
+		return
+	}
+	performance, ok := a.thirteenF.tablePath(w, thirteenPerformance)
+	if !ok {
+		return
+	}
+	names, ok := a.thirteenF.tablePath(w, thirteenFilerNames)
+	if !ok {
+		return
+	}
+	book, ok := a.thirteenF.tablePath(w, thirteenHoldings)
+	if !ok {
+		return
+	}
+	bookFrom, scoresFrom := thirteenFrom(book), thirteenFrom(scores)
+	cik, ok := cikParam(w, r)
+	if !ok {
+		return
+	}
+	quarters, err := a.thirteenQuarters(r.Context(), thirteenFrom(performance), cik)
+	if err != nil {
+		a.thirteenFailed(w, "flow", err)
+		return
+	}
+	if len(quarters) == 0 {
+		writeError(w, http.StatusNotFound, "no filings for that filer; see /api/13f/funds")
+		return
+	}
+	period, ok := thirteenPeriod(w, r, quarters)
+	if !ok {
+		return
+	}
+	if !oneOf(quarters, period) {
+		writeError(w, http.StatusNotFound, "no filing for that filer in that period; see the quarters list")
+		return
+	}
+	prevPeriod := ""
+	for i, quarter := range quarters {
+		if quarter == period && i > 0 {
+			prevPeriod = quarters[i-1]
+		}
+	}
+
+	bookOf := func(quarter string) (FlowBook, error) {
+		var total FlowBook
+		err := a.thirteenF.db.QueryRowContext(r.Context(),
+			fmt.Sprintf(`SELECT count(*), COALESCE(SUM(value_usd), 0) FROM %s
+				WHERE cik = ? AND report_period = ?`, bookFrom),
+			cik, quarter).Scan(&total.Positions, &total.ValueUSD)
+		return total, err
+	}
+	current, err := bookOf(period)
+	if err != nil {
+		a.thirteenFailed(w, "flow", err)
+		return
+	}
+	var previous *FlowBook
+	if prevPeriod != "" {
+		left, err := bookOf(prevPeriod)
+		if err != nil {
+			a.thirteenFailed(w, "flow", err)
+			return
+		}
+		previous = &left
+	}
+
+	// Every position of either book, with both values as filed. The view already
+	// excludes a fund's first filing, so an empty result is one with no previous
+	// book rather than a quarter that traded nothing.
+	bandsQuery := fmt.Sprintf(`SELECT cusip, ticker, issuer, action, value_usd, prev_value_usd,
+			portfolio_weight_pct, prev_portfolio_weight_pct, est_capital_flow, split_adjusted
+		FROM %s WHERE cik = ? AND report_period = ?`, scoresFrom)
+	type flowRow struct {
+		FlowBand
+		est sql.NullFloat64
+	}
+	rows := []flowRow{}
+	if err := a.thirteenRows(r.Context(), bandsQuery, []any{cik, period}, func(rs *sql.Rows) error {
+		var row flowRow
+		if err := rs.Scan(&row.Cusip, &row.Ticker, &row.Issuer, &row.Action, &row.ValueUSD,
+			&row.PrevValueUSD, &row.WeightPct, &row.PrevWeightPct, &row.est, &row.SplitAdjusted); err != nil {
+			return err
+		}
+		if row.est.Valid {
+			flow := row.est.Float64
+			row.EstFlowUSD = &flow
+		}
+		rows = append(rows, row)
+		return nil
+	}); err != nil {
+		a.thirteenFailed(w, "flow", err)
+		return
+	}
+
+	// The named set: the largest rows of each side, by the value that side reports.
+	// A position that grew into the book and one that was sold out of it are both
+	// named, which is the whole point of taking a union rather than one ranking.
+	named := make([]bool, len(rows))
+	rank := func(value func(flowRow) float64) {
+		order := make([]int, len(rows))
+		for i := range order {
+			order[i] = i
+		}
+		sort.SliceStable(order, func(a, b int) bool {
+			left, right := rows[order[a]], rows[order[b]]
+			if value(left) != value(right) {
+				return value(left) > value(right)
+			}
+			return left.Cusip < right.Cusip
+		})
+		for i, index := range order {
+			if i >= flowSlices {
+				break
+			}
+			named[index] = true
+		}
+	}
+	rank(func(row flowRow) float64 { return row.ValueUSD })
+	rank(func(row flowRow) float64 { return row.PrevValueUSD })
+
+	positions := []FlowBand{}
+	others := FlowOthers{}
+	tailFlow := 0.0
+	tailPriced := false
+	for i, row := range rows {
+		if named[i] {
+			positions = append(positions, row.FlowBand)
+			continue
+		}
+		others.PrevValueUSD += row.PrevValueUSD
+		others.ValueUSD += row.ValueUSD
+		if row.EstFlowUSD == nil {
+			others.Unpriced++
+		}
+		if row.PrevValueUSD > 0 {
+			others.PrevPositions++
+		}
+		if row.ValueUSD > 0 {
+			others.Positions++
+		}
+		if row.EstFlowUSD != nil {
+			tailFlow += *row.EstFlowUSD
+			tailPriced = true
+		}
+	}
+	if tailPriced {
+		others.EstFlowUSD = &tailFlow
+	}
+	// Largest first by whichever side is bigger, so the rows of the response read
+	// in the order a reader would point at them; the page ranks them again for its
+	// own columns.
+	sort.SliceStable(positions, func(a, b int) bool {
+		left := max(positions[a].ValueUSD, positions[a].PrevValueUSD)
+		right := max(positions[b].ValueUSD, positions[b].PrevValueUSD)
+		if left != right {
+			return left > right
+		}
+		return positions[a].Cusip < positions[b].Cusip
+	})
+
+	var filerName string
+	if err := a.thirteenCount(r.Context(),
+		fmt.Sprintf("SELECT COALESCE(max(filer_name), '') FROM %s WHERE cik = ?",
+			thirteenFrom(names)), []any{cik}, &filerName); err != nil {
+		a.thirteenFailed(w, "flow", err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"cik": cik, "filerName": filerName, "period": period, "prevPeriod": prevPeriod,
+		"quartersBetween": quartersApart(prevPeriod, period), "quarters": quarters,
+		"slices": flowSlices, "previous": previous, "current": current,
+		"positions": positions, "others": others,
+	})
+}
+
 // sortOrder resolves one of the rankings a list endpoint offers, returning both
 // the name it matched and the ORDER BY that answers it, so the response can echo
 // which ranking produced the rows.
@@ -946,3 +1184,20 @@ func oneOf(values []string, wanted string) bool {
 
 // formatPeriod renders a report period the way the SQL file and the API do.
 func formatPeriod(period time.Time) string { return period.Format("2006-01-02") }
+
+// quartersApart counts the quarters between two report dates, positive when `to`
+// is the later one and zero when there is no earlier date — the same arithmetic
+// fund_quarterly_flows uses for its quarters_between, which is what marks a filer
+// that skipped quarters and so carries a whole gap's mark in one filing.
+func quartersApart(from, to string) int64 {
+	if from == "" {
+		return 0
+	}
+	start, startErr := time.Parse("2006-01-02", from)
+	end, endErr := time.Parse("2006-01-02", to)
+	if startErr != nil || endErr != nil {
+		return 0
+	}
+	number := func(when time.Time) int64 { return int64(4*when.Year() + (int(when.Month())-1)/3 + 1) }
+	return number(end) - number(start)
+}

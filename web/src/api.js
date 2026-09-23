@@ -156,6 +156,16 @@ export function thirteenFund(cik, period = '', sort = 'value', limit = 2000) {
   return getJSON(`/13f/fund?${query({ cik, period, sort, limit })}`);
 }
 
+// thirteenFlow answers the flow page: one filing's book beside the previous
+// filing's, as the bands a diagram draws, with every position neither side's
+// largest twelve covers aggregated into one tail. An empty period is the newest
+// filing the lake holds. A fund whose first filing is the requested quarter, or
+// one that filed only once, answers with a null previous book, which is a state
+// the page states rather than an error.
+export function thirteenFlow(cik, period = '') {
+  return getJSON(`/13f/flow?${query({ cik, period })}`);
+}
+
 // thirteenRefresh answers 202 when it started a build and 409 when one is
 // already running. Both bodies are the status, and both are states the
 // dashboard renders rather than errors, so neither is thrown: the status it

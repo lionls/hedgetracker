@@ -469,14 +469,15 @@ visible before any of that work starts.
 
 `server/` and `web/` are a browser for those tables: a ticker search, a company
 card, a candlestick chart with volume, a second page that lists operating
-companies with their financial statements, a 13F dashboard and a fund analytics
-page built on the same holdings lake. The Go process answers every request
+companies with their financial statements, a 13F dashboard, a fund analytics page
+and a book-flow page built on the same holdings lake. The Go process answers every
+request
 straight from the Parquet files on the Hub — no local copy of a table, no database
 file, nothing written outside DuckDB's spill directory in `/tmp` — and the React
-app is four pages with no router and no state library, because each page is a
+app is five pages with no router and no state library, because each page is a
 handful of endpoints and a handful of pieces of state. Every page is one
-component with a `page` prop, chosen from `location.pathname`; navigation is four
-`<a href>`s that reload the bundle, which is cheaper than a router for four pages
+component with a `page` prop, chosen from `location.pathname`; navigation is five
+`<a href>`s that reload the bundle, which is cheaper than a router for five pages
 of a local app.
 
 | | |
@@ -555,6 +556,7 @@ Three properties of the serving path matter to a client:
 | `GET /api/13f/holdings?cik=2038506&period=2024Q2` | `{"cik":"0002038506","period":"2024-06-30","quarters":[…11 periods…],"portfolioValueUsd":131104358,"total":67,"holdings":[{"cusip":"464288679","ticker":"SHV","issuer":"ISHARES TR","classTitle":"SHORT TREAS BD","shares":127843,"valueUsd":14126679,"weightPct":10.7751,"reportedLines":1},…]}`; `period` takes a date, a quarter label or `latest`, and defaults to the filer's newest filing; the weights of a fund-quarter sum to 100% |
 | `GET /api/13f/flows?cik=2038506&action=NEW,ADDED` | `{"cik":"0002038506","period":"","actions":[…],"total":389,"flows":[{"cik":"0002038506","period":"2024-06-30","prevPeriod":"2024-03-31","quartersBetween":1,"cusip":"595112103","ticker":"MU","issuer":"MICRON TECHNOLOGY INC","action":"NEW","shares":17554,"valueUsd":2308878,"weightPct":1.7611,"prevShares":0,"deltaShares":17554,"deltaSharesPct":null,"deltaWeightPct":1.7611,"splitFactor":1,"splitAdjusted":false},…]}`; without `period` it reports the fund's whole history, newest first |
 | `GET /api/13f/signals?period=2024Q2&signal=HIGH_CONVICTION_BUY` | the flow shape plus `signal`, `quarterlyVwap`, `quarterlyLow`, `quarterlyHigh`, `estCapitalFlow` and `filerName`. The filters are `cik`, `ticker`, `period`, `action` and `signal`, and `period=latest` is the default; with no filters it answers the lake's newest quarter, largest estimated flow first, and for one fund and ticker it is the position: `?cik=2038506&period=2024Q2&ticker=NVDA` is `{"action":"TRIMMED","shares":20139,"prevShares":21720,"deltaShares":-1581,"splitFactor":10,"splitAdjusted":true,"weightPct":1.8977,"signal":"PASSIVE_REBALANCE","quarterlyVwap":100.3169,"estCapitalFlow":-158601}` |
+| `GET /api/13f/flow?cik=2038506&period=2024-06-30` | `{"cik":"0002038506","filerName":"","period":"2024-06-30","prevPeriod":"2024-03-31","quartersBetween":1,"slices":12,"quarters":[…11 dates…],"previous":{"period":"2024-03-31","positions":69,"valueUsd":133597275},"current":{"period":"2024-06-30","positions":67,"valueUsd":131104358},"positions":[{"cusip":"464288679","ticker":"SHV","issuer":"ISHARES TR","action":"TRIMMED","prevValueUsd":14244471,"valueUsd":14126679,"prevWeightPct":10.6622,"weightPct":10.7751,"estFlowUsd":null,"splitAdjusted":false},…15 rows…],"others":{"prevPositions":55,"positions":53,"prevValueUsd":67219626,"valueUsd":64911353,"estFlowUsd":3828842,"unpriced":10}}` — the two books of one transition, side by side: the named rows are the union of each side's `slices` largest positions — an exit that was one of the left book's big names is named even though the right side does not hold it — ordered largest first by whichever of its two values is bigger, and each carries only what a band needs (the two values, the two weights, the action and the estimated trade, `null` where the ticker has no price bars); `others` is the aggregated tail, so the named rows plus `others` add up to `previous.valueUsd` and to `current.valueUsd` exactly. `period` takes a date, a quarter label or `latest`; a fund with one filing, or its own earliest filing, answers `"previous":null` and no positions, and `filerName` is `""` on an unnamed lake |
 | `GET /api/13f/fund?cik=2038506&period=2024-06-30&sort=value&limit=2000` | `{"cik":"0002038506","filerName":"","period":"2024-06-30","sort":"value","quarters":[…11 dates…],"series":[…11 rows…],"total":81,"limit":2000,"positions":[…81 rows…]}` — one row per filing in `series`, the cursor's quarter named by `period`, and the same row spelled out: `{"period":"2024-06-30","reportYear":2024,"reportQuarter":2,"prevPeriod":"2024-03-31","quartersBetween":1,"positions":67,"portfolioValueUsd":131104358,"movedPositions":81,"positionsWithPnl":63,"pnlUsd":-708441,"cumulativePnlUsd":-21396093,"coveredValueUsd":70700295,"coveragePct":53.9267,"newPositions":12,"addedPositions":27,"trimmedPositions":23,"exitedPositions":14,"heldPositions":5,"purchasedUsd":19978177.83,"soldUsd":17100750.04,"purchasedPositions":30,"soldPositions":29}`. Each position is the flow shape plus the mark: `{"cusip":"67066G104","ticker":"NVDA","issuer":"NVIDIA CORP","action":"TRIMMED","shares":20139,"valueUsd":2487972,"weightPct":1.8977,"prevShares":21720,"deltaShares":-1581,"deltaValueUsd":525440,"quartersBetween":1,"splitFactor":10,"splitAdjusted":true,"prevVwap":74.003,"vwap":100.3169,"pnlUsd":571538,"pnlPct":35.5579,"cumulativePnlUsd":695234,"priced":true}` — `pnlUsd` is the split-adjusted `prevShares × (vwap − prevVwap)`, so the dataset's adjusted VWAPs carry the split and our `splitFactor` carries the shares, and `cumulativePnlUsd` is the same marks summed per CUSIP over the fund's filings through `period` — the fund's own running total asked per position, `null` where none of the position's marked quarters had a price. `period` takes a date, a quarter label or `latest`, and defaults to the newest filing; `sort` is one of `value`, `weight`, `gain`, `loss` and anything else is a `400`; `limit` (default 100, capped at 2000) cuts `positions` while `total` keeps the whole count — and beside them `"holdings":{"largest":[{"cusip":"464288679","ticker":"SHV","issuer":"ISHARES TR","valueUsd":14126679,"weightPct":10.7751},…],"positions":67,"valueUsd":131104358}`, the quarter's book from `holdings_normalized`, largest first, which is the whole of what the funds page's donut draws |
 | `GET /api/13f/vwap?ticker=NVDA` | `{"ticker":"NVDA","quarters":[{"symbol":"NVDA","year":2024,"quarter":2,"tradingDays":63,"firstTradeDate":"2024-04-01","lastTradeDate":"2024-06-28","totalVolume":27164691100,"vwap":100.3169,"low":75.606,"high":140.76},…]}` — newest quarter first, up to `limit` (default 40, capped at 400), so the cap drops the oldest quarters of a long history rather than the newest |
 | `POST /api/13f/refresh` | `202` with the status body, or `409` with it while a build is running |
@@ -570,7 +572,10 @@ drill-down from a signal row is `/signals?cik=…&ticker=…`, with the price co
 beside it from `/vwap?ticker=…`; and the refresh button is `POST /refresh`. The
 [funds page](#the-funds-page) adds one call of its own, `/fund?cik=…`, because
 every panel on it reads the same `series` array and splitting that into five
-requests would let the panels disagree with each other.
+requests would let the panels disagree with each other. The
+[flow page](#the-flow-page) adds one, `/flow?cik=…&period=…`, for the same reason
+in the other direction: its two columns are two filings, and a band read from one
+response cannot disagree with the book read from another.
 
 Six things the numbers mean, which the SQL file argues in full:
 
@@ -817,6 +822,101 @@ is 794 positions worth $1.5B, which the ring draws out of `holdings_normalized`
 while every panel that needs a previous quarter to compare against has nothing to
 say at all.
 
+### The flow page
+
+`/flow` is the fund picker and one picture: the book of a fund's previous filing
+on the left, the book of the quarter selected above on the right, and one band per
+position per kind of change between them, so what was added, what was trimmed and
+what left the book is read at a glance rather than assembled from a table. The
+quarter selector walks every transition the fund has — `2024 Q1 → 2024 Q2` is the
+newest, and picking `2022-03-31` redraws against `2021-12-31` — and the fund
+selection is component state rather than a query parameter, the way it is on the
+funds page.
+
+**The bands are four, and the trade is the estimated one.** A position's two
+values are as filed, so its bands add up to them exactly: the smaller of the two
+is `carried` — the grey the donut also gives everything it does not name — and what
+is left over is the change. The change splits in two, and the split is the reason
+the picture is worth drawing: a naive value-delta diagram labels price
+appreciation "bought", so the traded part is capped at `est_capital_flow` (the
+split-adjusted share delta at the quarter's volume-weighted mean close, the same
+estimate the funds page marks P&L with) and the remainder is labelled *the market*.
+Green and red therefore mean a trade happened and blue means the value moved
+without one. A position whose ticker has no daily bars has no such estimate, and
+its band follows its action instead — `NEW`/`ADDED` bought, `TRIMMED`/`EXITED`
+sold, anything else the market's move. That fallback is deliberately about shares
+and not about value: the share count did change, so calling the whole move the
+market's would state something the data contradicts; only the size of the trade is
+unknown. The aggregated tail has no action at all, so it is never credited with a
+trade it cannot show, and the note under the figure counts the positions this
+affects on both sides — 8 of the 15 named rows and 10 of the tail at 2024 Q2 over
+this lake, where the index ETFs and a few others have no bars.
+
+**Both columns are the same height, and the picture is not a funnel.** A band can
+only be drawn from somewhere, so the figure adds the two nodes the book does not
+hold: `added` on the left, which is the sum of every position's growth and feeds
+the left column, and `removed` on the right, which is the sum of every shrink and
+drains the right one. Both columns are then the same height and drawn on one
+scale — 246.99 and 247.01 units at 2024 Q2, at 1.7928e-6 units to the dollar — and
+the difference between the two books is exactly the difference between their
+boundary nodes: `$133,597,275` of left book and `$131,104,358` of right, with
+`added $4.18M` against `removed $6.67M`, two figures that differ by the book's own
+change of `$2,492,917`. That is what makes the picture a rectangle rather than a
+funnel, and what lets the two sides be compared by eye at all. A position is a node
+on a side only if it is held on that side, so an exit leaves a row on the left and
+nothing opposite it, and an entry the reverse; the two boundary nodes are the only
+ones that are not positions.
+
+**The names are a union, and the tail is one node.** The named set is the twelve
+largest rows of each side by the value that side reports — not the top twelve of
+the book, which would drop the exit the diagram exists to show. Everything else is
+one node per side labelled `the rest`, carrying the aggregated tail's own values,
+position counts and `est_capital_flow`, and never an invented count: `0002038506`
+at 2024 Q2 is 15 named rows over `55 positions worth $67,219,626 at 2024-03-31, 53
+worth $64,911,353 at 2024-06-30`. The tail is a source like any other in the
+arithmetic — it carries bands of its own — which is why its bands are drawn and
+not summarised.
+
+**The endpoint sends the two values and the client does the arithmetic.** Bands
+are computed in the component from `prevValueUsd`, `valueUsd` and `estFlowUsd`
+rather than returned as `boughtUsd`/`soldUsd`, so the caption cannot disagree with
+the picture: the legend is the sums of the bands actually painted, all four of them
+present whenever they are non-zero, and the figure is one component that draws what
+it computed. The bands are layered `carried` first so the two trade colours and the
+market's blue paint over the grey bulk where ribbons cross, and the bands of a node
+are ordered by where their other end sits, which is what keeps a node's ribbons
+from pairing off against each other.
+
+**The drawing is SVG with geometry the tests can read.** There is no chart
+dependency: the ribbons are cubic paths from `x = 107` (the left column's far edge)
+to `x = 893` (the right column's near edge) and the nodes are `<rect>`s in two
+columns eleven units wide, in a viewBox 1000 wide and `46 + body + 24` tall, where
+`body` is 22 units per row of the taller column, floored at 300. Those coordinates
+are why the figure could be checked band by band: a band's two ends are the first
+and last pairs of numbers in its path, so tiling (a node's bands covering it
+exactly and contiguously), equal ribbon ends and one shared scale are all
+assertions over the DOM. Rows are 22 units rather than 26 because the panel shares
+the page's one scrolling column: at 1440×900 the figure is 550 px in a 624 px
+section and the whole page is exactly the window, so nothing needs scrolling; at
+1365×768 the figure is 519 px against a 492 px section and the last 72 px of it are
+one scroll of the section's own overflow — the same shell behaviour the funds
+page's donut has (there, 75 px of a 308 px panel). It is a real defect in the
+shell's fixed-height `.section`, not in the figure, and it is not worked around
+here: `.sankey` is `width: 100%; height: auto`, which is the one way to scale a
+viewBox with its aspect ratio intact, and the rows are sized so the picture fits at
+a desktop height.
+
+**A first filing has nothing to flow from, and says so.** The named set comes from
+`conviction_scores`, which excludes a fund's first filing, so a fund with one
+filing answers `previous: null` — and so does a fund's own earliest quarter when a
+later one is picked, because a transition needs both filings. `previous` is decided
+from the filer's period list and never from a query returning no rows, so "the
+first filing" and "a filing that happened to hold nothing" cannot be confused. The
+page renders the fund's headline and quarter selector as usual and a sentence where
+the figure would be: `2024 Q2 is this fund's first filing in the lake, so there is
+no book to flow from`, plus the first transition the lake can draw when there is
+one.
+
 ### Running it
 
 ```sh
@@ -883,9 +983,9 @@ and compress the bundle in front of the container if that matters. Only
 ### Measured
 
 Against the running server on 2026-09-15, over the proxy this sandbox uses (the
-`/fund` rows, the price-panel row and the bundle row were re-measured on
-2026-09-23, and the 13F build row on both days; the boot rows are the 2026-09-22
-run):
+`/fund` rows, the price-panel row, the `/flow` rows and the bundle row were
+re-measured on 2026-09-23, and the 13F build row on both days; the boot rows are
+the 2026-09-22 run):
 
 | Step | Measured |
 | --- | --- |
@@ -907,7 +1007,8 @@ run):
 | `GET /api/13f/fund?cik=891943&limit=2000`, a fund with one filing and 794 positions | 13 ms, 1,876 B: no `series` to speak of, `positions` empty because the flows exclude a first filing, and `holdings.largest` twelve names with 794 and $1,501,802,000 behind them |
 | Boot: the 13F build over the 25-file smoke lake with the real price dataset | 205.9 s on the 2026-09-22 run, 207.2 s on the 2026-09-23 one — index warm 3.7 s, 12,333 priced symbols in 36.5 s, then the six tables |
 | `GET /api/13f/vwap?ticker=NVDA`, the price panel's query | 11 rows over the 2021 Q4 – 2024 Q2 window the lake covers, newest quarter first; `limit=5` keeps 2024 Q2 … 2023 Q2, so a cap cuts the oldest rows |
-| `npm run build`, the four pages | 0.29 s — 431.56 kB JS (134.54 kB gzipped), 8.74 kB CSS (2.32 kB gzipped); the donut is 2.53 kB of the JS and 0.98 kB of the CSS |
+| `GET /api/13f/flow?cik=2038506&period=2024-06-30`, the flow page's read | 3,586 B — 15 named rows against `previous {69, $133,597,275}` and `current {67, $131,104,358}` with the tail's 55 and 53 positions behind `others`; 8–14 ms across five reads of the same quarter, and 317 B / 6 ms for `0000891943`, whose single filing answers `"previous":null` and draws nothing |
+| `npm run build`, the five pages | 0.23 s — 443.19 kB JS (137.81 kB gzipped), 9.46 kB CSS (2.45 kB gzipped); the donut is 2.53 kB of the JS and 0.98 kB of the CSS, and the flow page is the 11.63 kB of JS the build grew by when it and its route were added, of which `Sankey.jsx` is 8,793 B minified on its own (8,793 B / 3,242 B gzipped with `bun build`, react external) |
 
 ### Why it is shaped this way
 
@@ -1442,6 +1543,42 @@ where each canvas would be, and the ring still drew `$1.5B / 794 positions` with
 wrapped to the donut over a two-column legend with no horizontal overflow, and no
 console or page error appeared on any of those passes.
 
+The flow diagram was read back out of the DOM the same way, band by band, on that
+run. Its arithmetic was recomputed from scratch in the page — for every named row
+and for the tail, `carried + shrink = prevValueUsd` and `carried + growth =
+valueUsd` held exactly — and then against the drawing: all 36 ribbons' tooltips
+equalled their recomputed band, the four legend strings equalled the sums of the
+bands actually painted (`carried $126.93M, bought $2.73M, sold $3.41M, the market
+$4.7M`), every node was tiled by its bands with no gap and no overhang (32 rects,
+36 paths, 0 defects), every ribbon's two ends were the same thickness, and the two
+columns carried 246.99 and 247.01 units of band — one scale for both, 1.7928e-6
+units per dollar, so a node's height is its own values' to within 0.0322% at the
+worst of the eight labelled ones (the coordinates are rounded to a hundredth of a
+unit, and the rest is that rounding). The columns
+summed to the two filings exactly: `133,597,275` against `previous.valueUsd` and
+`131,104,358` against `current.valueUsd`, their difference `-2,492,917` equal to
+`added - removed`, and the four labelled positions of each column carried the same
+text as the API — 12 labels in the figure, the other four being the two tails and
+`added $4.18M` / `removed $6.67M`. Switching the quarter through the select moved
+everything with it — `2021 Q4 → 2022 Q1`, 33 rects, 36 ribbons, 14 labels,
+`$117,053,293` and `$107,819,533` on a scale of 2.0586e-6, `added - removed` equal
+to that book's `-9,233,760`, 262.02 units on either side, the same zero defects at
+the same tolerances and a worst node off its dollars by 0.0255% — and the fund with
+one filing drew no `<svg>` at all, only `no previous filing to flow from` over the
+sentence explaining it. Two label placements were fixed by what the picture looked
+like rather than by an assertion: the `added` and `removed` nodes are always named
+now, drawn under their block when the block is too small to hold a line
+(`added $4.18M` at 2024 Q2 would otherwise have been an unlabelled sliver), and the
+label floor came down from 13 to 10 units because the closest two labels can be is
+17 units apart against a 12-unit line — there are 12 labels in the figure and 6.3
+units between the closest pair. The panel was measured at three window sizes: at
+1440×900 the figure is 550.3 px in a 624 px section with the whole page exactly the
+window and the note's last line at its bottom edge, at 1920×1080 736.9 px in 804
+px, and at 1365×768 518.6 px against a 492 px section, so 72 px of the figure is one
+scroll of the section's own overflow (at 1280×720, 84 px) — the shell's fixed-height
+`.section` and not the figure, the same behaviour the funds page's donut has there
+(75 px of a 308 px panel). No console or page error appeared on any pass.
+
 The branches that are not the happy path were driven too, on the same real
 dataset. `0000891943` — 794 positions, one filing — showed `794 positions · 2024 Q2
 · 1 filing in the lake`, a single quarter select with nothing to compare against, no
@@ -1456,6 +1593,7 @@ a different code path. The 13F page was then re-run against the same real server
 after the picker was extracted: the search narrowed to one result, the fund moved
 the headline to `$131.1M portfolio` with 81 holdings rows, 25 quarter moves and 11
 flows rows, and selecting `2022-03-31` gave `82 changed positions · 2022 Q1`. The
-dashboard still routes four pages (`/`, `/stocks`, `/13f`, `/funds`). Offline, `go
+dashboard still routes five pages (`/`, `/stocks`, `/13f`, `/funds`, `/flow`).
+Offline, `go
 vet` and `gofmt` are clean, the 61 tests pass in 129.9 s, `ruff check` and `ruff
-format --check` pass, and `npm run build` writes the four pages in 0.26 s.
+format --check` pass, and `npm run build` writes the five pages in 0.23 s.
