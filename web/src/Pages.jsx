@@ -6,6 +6,7 @@ const PAGES = [
   { page: 'stocks', path: '/stocks', label: 'Stocks' },
   { page: '13f', path: '/13f', label: '13F' },
   { page: 'funds', path: '/funds', label: 'Funds' },
+  { page: 'flow', path: '/flow', label: 'Flow' },
 ];
 
 export default function Pages({ page }) {

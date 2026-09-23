@@ -3,7 +3,7 @@ import Pages from './Pages.jsx';
 import { thirteenFunds, thirteenRefresh, thirteenStatus } from './api.js';
 import { dollars, period, plural, stamp } from './numbers.js';
 
-// The sidebar the two fund pages share: the fund list and its search, the lake's
+// The sidebar the fund pages share: the fund list and its search, the lake's
 // health line, and the rebuild button. It owns the status it follows — read
 // once, then polled while a build runs — and hands every reading up through
 // onStatus, because the panels below the headline read the same build, while the

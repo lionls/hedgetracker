@@ -687,6 +687,85 @@ body {
   text-align: right;
 }
 
+/* The two-quarter flow: the previous filing's book in the left column, the
+   selected quarter's in the right, and one band per position per kind of change.
+   The whole picture is one SVG, so a ribbon's ends land on the node they came from
+   at whatever width the panel takes, which a row of absolutely placed elements
+   cannot promise. */
+.sankey {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.sankey-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  flex: 1 1 100%;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.sankey-legend li {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+}
+
+.sankey-swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+}
+
+.sankey-value {
+  color: var(--muted);
+}
+
+/* An SVG label sits on the drawing, so it must not take the hover its node's
+   ribbon is waiting for. */
+.sankey-label {
+  fill: var(--text);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+.sankey-label-value,
+.sankey-column {
+  fill: var(--muted);
+}
+
+.sankey-column {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Hovering a ribbon dims the rest of the picture: the bands cross, and following
+   one of them by eye is what the diagram is for. The dim rides on the group
+   rather than on a state, because a link is a link whether or not a pointer is
+   over it. */
+.sankey-links:hover .sankey-link {
+  opacity: 0.2;
+}
+
+.sankey-links .sankey-link:hover {
+  opacity: 0.85;
+}
+
+.sankey-link {
+  transition: opacity 120ms ease;
+}
+
+.sankey-note {
+  margin: 8px 0 0;
+  font-size: 11px;
+}
+
 /* The quarter's P&L per position: one row per mark, the bar drawn out from the
    axis at the centre of the track, so gains and losses read as one distribution
    and the axis stays put as the page changes quarter. */

@@ -36,6 +36,7 @@ func (a *API) routes() http.Handler {
 	api.HandleFunc("GET /api/13f/signals", a.thirteenfSignals)
 	api.HandleFunc("GET /api/13f/vwap", a.thirteenfVWAP)
 	api.HandleFunc("GET /api/13f/fund", a.thirteenfFund)
+	api.HandleFunc("GET /api/13f/flow", a.thirteenfFlow)
 	api.HandleFunc("POST /api/13f/refresh", a.thirteenfRefresh)
 
 	root := http.NewServeMux()
