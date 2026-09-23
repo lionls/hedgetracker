@@ -556,13 +556,14 @@ Three properties of the serving path matter to a client:
 | `GET /api/13f/flows?cik=2038506&action=NEW,ADDED` | `{"cik":"0002038506","period":"","actions":[…],"total":389,"flows":[{"cik":"0002038506","period":"2024-06-30","prevPeriod":"2024-03-31","quartersBetween":1,"cusip":"595112103","ticker":"MU","issuer":"MICRON TECHNOLOGY INC","action":"NEW","shares":17554,"valueUsd":2308878,"weightPct":1.7611,"prevShares":0,"deltaShares":17554,"deltaSharesPct":null,"deltaWeightPct":1.7611,"splitFactor":1,"splitAdjusted":false},…]}`; without `period` it reports the fund's whole history, newest first |
 | `GET /api/13f/signals?period=2024Q2&signal=HIGH_CONVICTION_BUY` | the flow shape plus `signal`, `quarterlyVwap`, `quarterlyLow`, `quarterlyHigh`, `estCapitalFlow` and `filerName`. The filters are `cik`, `ticker`, `period`, `action` and `signal`, and `period=latest` is the default; with no filters it answers the lake's newest quarter, largest estimated flow first, and for one fund and ticker it is the position: `?cik=2038506&period=2024Q2&ticker=NVDA` is `{"action":"TRIMMED","shares":20139,"prevShares":21720,"deltaShares":-1581,"splitFactor":10,"splitAdjusted":true,"weightPct":1.8977,"signal":"PASSIVE_REBALANCE","quarterlyVwap":100.3169,"estCapitalFlow":-158601}` |
 | `GET /api/13f/fund?cik=2038506&period=2024-06-30&sort=value&limit=2000` | `{"cik":"0002038506","filerName":"","period":"2024-06-30","sort":"value","quarters":[…11 dates…],"series":[…11 rows…],"total":81,"limit":2000,"positions":[…81 rows…]}` — one row per filing in `series`, the cursor's quarter named by `period`, and the same row spelled out: `{"period":"2024-06-30","reportYear":2024,"reportQuarter":2,"prevPeriod":"2024-03-31","quartersBetween":1,"positions":67,"portfolioValueUsd":131104358,"movedPositions":81,"positionsWithPnl":63,"pnlUsd":-708441,"cumulativePnlUsd":-21396093,"coveredValueUsd":70700295,"coveragePct":53.9267,"newPositions":12,"addedPositions":27,"trimmedPositions":23,"exitedPositions":14,"heldPositions":5,"purchasedUsd":19978177.83,"soldUsd":17100750.04,"purchasedPositions":30,"soldPositions":29}`. Each position is the flow shape plus the mark: `{"cusip":"67066G104","ticker":"NVDA","issuer":"NVIDIA CORP","action":"TRIMMED","shares":20139,"valueUsd":2487972,"weightPct":1.8977,"prevShares":21720,"deltaShares":-1581,"deltaValueUsd":525440,"quartersBetween":1,"splitFactor":10,"splitAdjusted":true,"prevVwap":74.003,"vwap":100.3169,"pnlUsd":571538,"pnlPct":35.5579,"priced":true}` — `pnlUsd` is the split-adjusted `prevShares × (vwap − prevVwap)`, so the dataset's adjusted VWAPs carry the split and our `splitFactor` carries the shares. `period` takes a date, a quarter label or `latest`, and defaults to the newest filing; `sort` is one of `value`, `weight`, `gain`, `loss` and anything else is a `400`; `limit` (default 100, capped at 2000) cuts `positions` while `total` keeps the whole count |
-| `GET /api/13f/vwap?ticker=NVDA` | `{"ticker":"NVDA","quarters":[{"symbol":"NVDA","year":2024,"quarter":2,"tradingDays":63,"firstTradeDate":"2024-04-01","lastTradeDate":"2024-06-28","totalVolume":27164691100,"vwap":100.3169,"low":75.606,"high":140.76},…]}` |
+| `GET /api/13f/vwap?ticker=NVDA` | `{"ticker":"NVDA","quarters":[{"symbol":"NVDA","year":2024,"quarter":2,"tradingDays":63,"firstTradeDate":"2024-04-01","lastTradeDate":"2024-06-28","totalVolume":27164691100,"vwap":100.3169,"low":75.606,"high":140.76},…]}` — newest quarter first, up to `limit` (default 40, capped at 400), so the cap drops the oldest quarters of a long history rather than the newest |
 | `POST /api/13f/refresh` | `202` with the status body, or `409` with it while a build is running |
 | `GET /*` | `web/dist`, falling back to `index.html` |
 
 The panels are these calls and no more: a fund picker is `/funds`, searchable
 by name or CIK; a holdings table is `/holdings?cik=…` with its quarter selector
-filled from `quarters`; a
+filled from `quarters` and left on the quarter the response resolved, which is the
+filer's newest until one is picked; a
 "what changed" chart is `/flows?cik=…`, filtered by `action`; the dashboard's
 opening view — what conviction moved this quarter — is `/signals?period=…`; the
 drill-down from a signal row is `/signals?cik=…&ticker=…`, with the price context
@@ -830,7 +831,7 @@ and compress the bundle in front of the container if that matters. Only
 ### Measured
 
 Against the running server on 2026-09-15, over the proxy this sandbox uses (the
-13F rows and the bundle row were re-measured on 2026-09-22):
+13F rows, the price-panel row and the bundle row were re-measured on 2026-09-22):
 
 | Step | Measured |
 | --- | --- |
@@ -850,7 +851,8 @@ Against the running server on 2026-09-15, over the proxy this sandbox uses (the
 | `GET /api/13f/fund?cik=2038506&period=2024-06-30&sort=value&limit=2000` | 19 ms, 32,293 B — 11 filings in `series` and all 81 positions; 11–23 ms over the next four reads, because the price scan behind it belongs to the build and not to the request |
 | `GET /api/13f/fund?cik=2038506&period=2024-06-30&limit=25`, a window rather than the whole book | 13,878 B for 25 of 81 positions |
 | Boot: the 13F build over the 25-file smoke lake with the real price dataset | 205.9 s — index warm 3.7 s, 12,333 priced symbols in 36.5 s, then the six tables |
-| `npm run build`, the four pages | 0.25 s — 428.27 kB JS (133.51 kB gzipped), 7.76 kB CSS (2.10 kB gzipped) |
+| `GET /api/13f/vwap?ticker=NVDA`, the price panel's query | 11 rows over the 2021 Q4 – 2024 Q2 window the lake covers, newest quarter first; `limit=5` keeps 2024 Q2 … 2023 Q2, so a cap cuts the oldest rows |
+| `npm run build`, the four pages | 0.25 s — 428.28 kB JS (133.51 kB gzipped), 7.76 kB CSS (2.10 kB gzipped) |
 
 ### Why it is shaped this way
 

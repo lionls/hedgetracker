@@ -492,7 +492,9 @@ func (a *API) thirteenfSignals(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// thirteenfVWAP is market_quarterly_vwap for one ticker.
+// thirteenfVWAP is market_quarterly_vwap for one ticker, newest quarter first:
+// the panel is read against the quarter the dashboard has open, and the limit
+// has to cut the oldest quarters off a long history rather than the newest.
 func (a *API) thirteenfVWAP(w http.ResponseWriter, r *http.Request) {
 	path, ok := a.thirteenF.tablePath(w, thirteenVWAP)
 	if !ok {
@@ -507,7 +509,7 @@ func (a *API) thirteenfVWAP(w http.ResponseWriter, r *http.Request) {
 
 	query := fmt.Sprintf(`SELECT symbol, period_year, period_quarter, trading_days, first_trade_date,
 			last_trade_date, total_volume, quarterly_vwap, quarterly_low, quarterly_high
-		FROM %s WHERE symbol = ? ORDER BY period_year, period_quarter LIMIT %d`, thirteenFrom(path), limit)
+		FROM %s WHERE symbol = ? ORDER BY period_year DESC, period_quarter DESC LIMIT %d`, thirteenFrom(path), limit)
 	quarters := []VWAPRow{}
 	if err := a.thirteenRows(r.Context(), query, []any{ticker}, func(rs *sql.Rows) error {
 		var row VWAPRow
