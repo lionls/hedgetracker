@@ -555,7 +555,7 @@ Three properties of the serving path matter to a client:
 | `GET /api/13f/holdings?cik=2038506&period=2024Q2` | `{"cik":"0002038506","period":"2024-06-30","quarters":[…11 periods…],"portfolioValueUsd":131104358,"total":67,"holdings":[{"cusip":"464288679","ticker":"SHV","issuer":"ISHARES TR","classTitle":"SHORT TREAS BD","shares":127843,"valueUsd":14126679,"weightPct":10.7751,"reportedLines":1},…]}`; `period` takes a date, a quarter label or `latest`, and defaults to the filer's newest filing; the weights of a fund-quarter sum to 100% |
 | `GET /api/13f/flows?cik=2038506&action=NEW,ADDED` | `{"cik":"0002038506","period":"","actions":[…],"total":389,"flows":[{"cik":"0002038506","period":"2024-06-30","prevPeriod":"2024-03-31","quartersBetween":1,"cusip":"595112103","ticker":"MU","issuer":"MICRON TECHNOLOGY INC","action":"NEW","shares":17554,"valueUsd":2308878,"weightPct":1.7611,"prevShares":0,"deltaShares":17554,"deltaSharesPct":null,"deltaWeightPct":1.7611,"splitFactor":1,"splitAdjusted":false},…]}`; without `period` it reports the fund's whole history, newest first |
 | `GET /api/13f/signals?period=2024Q2&signal=HIGH_CONVICTION_BUY` | the flow shape plus `signal`, `quarterlyVwap`, `quarterlyLow`, `quarterlyHigh`, `estCapitalFlow` and `filerName`. The filters are `cik`, `ticker`, `period`, `action` and `signal`, and `period=latest` is the default; with no filters it answers the lake's newest quarter, largest estimated flow first, and for one fund and ticker it is the position: `?cik=2038506&period=2024Q2&ticker=NVDA` is `{"action":"TRIMMED","shares":20139,"prevShares":21720,"deltaShares":-1581,"splitFactor":10,"splitAdjusted":true,"weightPct":1.8977,"signal":"PASSIVE_REBALANCE","quarterlyVwap":100.3169,"estCapitalFlow":-158601}` |
-| `GET /api/13f/fund?cik=2038506&period=2024-06-30&sort=value&limit=2000` | `{"cik":"0002038506","filerName":"","period":"2024-06-30","sort":"value","quarters":[…11 dates…],"series":[…11 rows…],"total":81,"limit":2000,"positions":[…81 rows…]}` — one row per filing in `series`, the cursor's quarter named by `period`, and the same row spelled out: `{"period":"2024-06-30","reportYear":2024,"reportQuarter":2,"prevPeriod":"2024-03-31","quartersBetween":1,"positions":67,"portfolioValueUsd":131104358,"movedPositions":81,"positionsWithPnl":63,"pnlUsd":-708441,"cumulativePnlUsd":-21396093,"coveredValueUsd":70700295,"coveragePct":53.9267,"newPositions":12,"addedPositions":27,"trimmedPositions":23,"exitedPositions":14,"heldPositions":5,"purchasedUsd":19978177.83,"soldUsd":17100750.04,"purchasedPositions":30,"soldPositions":29}`. Each position is the flow shape plus the mark: `{"cusip":"67066G104","ticker":"NVDA","issuer":"NVIDIA CORP","action":"TRIMMED","shares":20139,"valueUsd":2487972,"weightPct":1.8977,"prevShares":21720,"deltaShares":-1581,"deltaValueUsd":525440,"quartersBetween":1,"splitFactor":10,"splitAdjusted":true,"prevVwap":74.003,"vwap":100.3169,"pnlUsd":571538,"pnlPct":35.5579,"cumulativePnlUsd":695234,"priced":true}` — `pnlUsd` is the split-adjusted `prevShares × (vwap − prevVwap)`, so the dataset's adjusted VWAPs carry the split and our `splitFactor` carries the shares, and `cumulativePnlUsd` is the same marks summed per CUSIP over the fund's filings through `period` — the fund's own running total asked per position, `null` where none of the position's marked quarters had a price. `period` takes a date, a quarter label or `latest`, and defaults to the newest filing; `sort` is one of `value`, `weight`, `gain`, `loss` and anything else is a `400`; `limit` (default 100, capped at 2000) cuts `positions` while `total` keeps the whole count |
+| `GET /api/13f/fund?cik=2038506&period=2024-06-30&sort=value&limit=2000` | `{"cik":"0002038506","filerName":"","period":"2024-06-30","sort":"value","quarters":[…11 dates…],"series":[…11 rows…],"total":81,"limit":2000,"positions":[…81 rows…]}` — one row per filing in `series`, the cursor's quarter named by `period`, and the same row spelled out: `{"period":"2024-06-30","reportYear":2024,"reportQuarter":2,"prevPeriod":"2024-03-31","quartersBetween":1,"positions":67,"portfolioValueUsd":131104358,"movedPositions":81,"positionsWithPnl":63,"pnlUsd":-708441,"cumulativePnlUsd":-21396093,"coveredValueUsd":70700295,"coveragePct":53.9267,"newPositions":12,"addedPositions":27,"trimmedPositions":23,"exitedPositions":14,"heldPositions":5,"purchasedUsd":19978177.83,"soldUsd":17100750.04,"purchasedPositions":30,"soldPositions":29}`. Each position is the flow shape plus the mark: `{"cusip":"67066G104","ticker":"NVDA","issuer":"NVIDIA CORP","action":"TRIMMED","shares":20139,"valueUsd":2487972,"weightPct":1.8977,"prevShares":21720,"deltaShares":-1581,"deltaValueUsd":525440,"quartersBetween":1,"splitFactor":10,"splitAdjusted":true,"prevVwap":74.003,"vwap":100.3169,"pnlUsd":571538,"pnlPct":35.5579,"cumulativePnlUsd":695234,"priced":true}` — `pnlUsd` is the split-adjusted `prevShares × (vwap − prevVwap)`, so the dataset's adjusted VWAPs carry the split and our `splitFactor` carries the shares, and `cumulativePnlUsd` is the same marks summed per CUSIP over the fund's filings through `period` — the fund's own running total asked per position, `null` where none of the position's marked quarters had a price. `period` takes a date, a quarter label or `latest`, and defaults to the newest filing; `sort` is one of `value`, `weight`, `gain`, `loss` and anything else is a `400`; `limit` (default 100, capped at 2000) cuts `positions` while `total` keeps the whole count — and beside them `"holdings":{"largest":[{"cusip":"464288679","ticker":"SHV","issuer":"ISHARES TR","valueUsd":14126679,"weightPct":10.7751},…],"positions":67,"valueUsd":131104358}`, the quarter's book from `holdings_normalized`, largest first, which is the whole of what the funds page's donut draws |
 | `GET /api/13f/vwap?ticker=NVDA` | `{"ticker":"NVDA","quarters":[{"symbol":"NVDA","year":2024,"quarter":2,"tradingDays":63,"firstTradeDate":"2024-04-01","lastTradeDate":"2024-06-28","totalVolume":27164691100,"vwap":100.3169,"low":75.606,"high":140.76},…]}` — newest quarter first, up to `limit` (default 40, capped at 400), so the cap drops the oldest quarters of a long history rather than the newest |
 | `POST /api/13f/refresh` | `202` with the status body, or `409` with it while a build is running |
 | `GET /*` | `web/dist`, falling back to `index.html` |
@@ -701,8 +701,9 @@ in rather than pinning the dashes on the symbol for the life of the process.
 `/funds` is the 13F lake drawn rather than tabulated: the same fund picker in the
 sidebar, then one quarter's figures above four `Over time` charts — portfolio value
 at each filing, the quarterly mark as bars with the running total as a line, money
-bought and sold, and positions opened and closed — a diverging bar panel of the
-quarter's per-position marks, and the positions behind them.
+bought and sold, and positions opened and closed — the quarter's book as a donut,
+a diverging bar panel of the quarter's per-position marks, and the positions
+behind them.
 
 **One request per page.** `GET /api/13f/fund?cik=…&period=…&sort=…&limit=…`
 answers the fund's whole history as a `series` array — one row per filing — with
@@ -750,6 +751,42 @@ last one's bars under the new headline; a new sort is the same answer in a
 different order, keeps the response the charts already have, and moves only the
 table, so the canvases are not rebuilt at all.
 
+**The book is the filing's, not the table's.** The donut above the P&L panel
+draws the selected quarter's book: a twelve-slice ring, largest position first,
+with everything past the twelfth collapsed into one muted `N others` slice, so
+the ring is the fund and not the top of a list — `0002038506` at 2024 Q2 is 12
+named positions over `55 others | 52.03% | $68.21M`, and `0000891943`'s single
+filing is 794 positions drawn as 12 names over `782 others | 73.85%`. The block
+is `holdings` inside the one response rather than a cut of the `positions` beside
+it, because those are already ordered and cut server-side by `sort` and `limit`:
+the page asks for `limit=2000`, so a book larger than that under `sort=loss` would
+have the ring ranked by the wrong column with a tail counted from the wrong rows.
+`holdings.largest` is the same twelve for every `sort` and every `limit` — measured
+`sort=value`, `sort=weight` and `sort=loss&limit=25` return an identical head —
+and the tail is what the client subtracts from `holdings.positions` and
+`holdings.valueUsd`, which are the whole quarter's count and value from the same
+group, so the panel adds up to the headline above it. It is one ordered read and
+two aggregate reads of one `(cik, report_period)` group, 1,281 bytes of a 35,616
+byte response. The weights are `portfolio_weight_pct`, the same column the table's
+`Weight` shows, so the legend and the table cannot disagree about a position. Like
+the figures, it reads `holdings_normalized` — the source the series' own
+`positions` count comes from, which is why the two agree. And it is the one panel
+that is never empty: a fund whose only filing is its first has no movement table,
+because the flows exclude a first filing, and the ring still draws its book.
+
+**The ring is circles, not arcs.** Each slice is a `<circle>` on a shared radius
+that is stroked with `stroke-dasharray` and rotated into place, rather than an arc
+path, because a path cannot draw a single 100% slice and one position is a real
+book — and because a stroke with a dash gap is the sector spacing for free, 1.5 of
+the 263.9 units of circumference, which is what makes the ring read as slices
+instead of a gradient. The twelve hues follow the wheel and the tail is
+deliberately a flat grey, so the part that is not a position cannot be mistaken
+for one. The centre — the book's value and its position count — is HTML over the
+SVG rather than `<text>` in it, for the same reason the P&L bars are elements: it
+is the panel's headline and should be selectable, crisp and sized by the page. The
+slices carry `<title>` tooltips and dim on hover in CSS, and there is no canvas
+and no chart library in the panel at all.
+
 **The position bars are CSS, not a chart.** The panel lists the eight largest
 gains and the eight largest losses of the quarter — the shape of a quarter rather
 than the whole book, which is what the table underneath is for — each as a labelled
@@ -769,7 +806,11 @@ values rather than a silent fallback to the default order.
 first filing, because there is nothing to compare it against, so a fund with one
 filing has no positions to show in the changed-position tables at all — the page
 renders its positions count and a sentence explaining the rule instead of an empty
-table with a sort control over nothing.
+table with a sort control over nothing. The book is not empty, though, and the
+donut above carries a fund like that without a caveat: `0000891943`'s only filing
+is 794 positions worth $1.5B, which the ring draws out of `holdings_normalized`
+while every panel that needs a previous quarter to compare against has nothing to
+say at all.
 
 ### Running it
 
@@ -838,7 +879,8 @@ and compress the bundle in front of the container if that matters. Only
 
 Against the running server on 2026-09-15, over the proxy this sandbox uses (the
 `/fund` rows, the price-panel row and the bundle row were re-measured on
-2026-09-23; the boot rows and the 13F build row are the 2026-09-22 run):
+2026-09-23, and the 13F build row on both days; the boot rows are the 2026-09-22
+run):
 
 | Step | Measured |
 | --- | --- |
@@ -855,11 +897,12 @@ Against the running server on 2026-09-15, over the proxy this sandbox uses (the
 | `GET /api/fundamentals/KO`, first read | 6.78 s, 1,991 B — five fiscal years, thirteen metrics, share count and trailing EPS |
 | `GET /api/fundamentals/KO` again, from the in-process cache | 0.51 ms |
 | The two reads behind that response, on a fresh DuckDB with the server's settings | 3.4 s (`stock_shares_outstanding` + `stock_tailing_eps`) + 3.0 s (`stock_statement`); 1.5 s + 1.5 s for the next symbol, whose file footers are already cached |
-| `GET /api/13f/fund?cik=2038506&period=2024-06-30&sort=value&limit=2000` | 17 ms, 34,317 B — 11 filings in `series` and all 81 positions, each carrying its own `cumulativePnlUsd`; 11–13 ms over the next four reads, because the price scan behind it belongs to the build and not to the request |
-| `GET /api/13f/fund?cik=2038506&period=2024-06-30&limit=25`, a window rather than the whole book | 14,483 B for 25 of 81 positions |
-| Boot: the 13F build over the 25-file smoke lake with the real price dataset | 205.9 s — index warm 3.7 s, 12,333 priced symbols in 36.5 s, then the six tables |
+| `GET /api/13f/fund?cik=2038506&period=2024-06-30&sort=value&limit=2000` | 18 ms, 35,616 B — 11 filings in `series` and all 81 positions, each carrying its own `cumulativePnlUsd`, plus the quarter's `holdings`: the twelve largest positions with the book's count and value, 1,281 B, which is the whole of the difference between this read and the 34,317 B it was before that block existed. 15.6–17.9 ms over the next four reads, because the price scan behind it belongs to the build and not to the request |
+| `GET /api/13f/fund?cik=2038506&period=2024-06-30&limit=25`, a window rather than the whole book | 15,782 B for 25 of 81 positions — the same 1,299 B of `holdings` on top of the 14,483 B window |
+| `GET /api/13f/fund?cik=891943&limit=2000`, a fund with one filing and 794 positions | 13 ms, 1,876 B: no `series` to speak of, `positions` empty because the flows exclude a first filing, and `holdings.largest` twelve names with 794 and $1,501,802,000 behind them |
+| Boot: the 13F build over the 25-file smoke lake with the real price dataset | 205.9 s on the 2026-09-22 run, 207.2 s on the 2026-09-23 one — index warm 3.7 s, 12,333 priced symbols in 36.5 s, then the six tables |
 | `GET /api/13f/vwap?ticker=NVDA`, the price panel's query | 11 rows over the 2021 Q4 – 2024 Q2 window the lake covers, newest quarter first; `limit=5` keeps 2024 Q2 … 2023 Q2, so a cap cuts the oldest rows |
-| `npm run build`, the four pages | 0.26 s — 429.03 kB JS (133.75 kB gzipped), 7.76 kB CSS (2.10 kB gzipped) |
+| `npm run build`, the four pages | 0.29 s — 431.56 kB JS (134.54 kB gzipped), 8.74 kB CSS (2.32 kB gzipped); the donut is 2.53 kB of the JS and 0.98 kB of the CSS |
 
 ### Why it is shaped this way
 
@@ -1366,6 +1409,33 @@ note state. The quarter switch moved the column with the page: `2022-09-30` read
 The section scrolls its own overflow, as its CSS comment says: 12 columns made the
 table 1,084.8 px in a 1,045 px wrapper at a 1,365 px viewport, ~80 px of horizontal
 scroll, and no console or page error appeared in any of the passes above.
+
+The holdings donut was read out of the DOM and out of its own paint on that same
+run. For `0002038506` at 2024 Q2 the centre read `$131.1M` over `67 positions` —
+the series row's own `portfolioValueUsd` and `positions` — and the legend listed
+the twelve names the `holdings` block returned, `SHV 10.78% $14.13M` down to
+`MELI 1.73% $2.27M`, over `55 others | 52.03% | $68.21M`, which is the 55 names and
+`$68,214,315` left once those twelve are taken out of the book. Every slice's
+`stroke-dasharray` was its legend weight less the 1.5-unit gap — 10.21% of the
+circumference for SHV, 51.46% for the tail — with the offsets accumulating
+consecutively to `-126.59` of `263.894` on the last one, so the ring is the book
+partitioned rather than a set of arcs that happen to look adjacent. The paint was
+measured by serialising the SVG into a canvas and sampling 3,600 points on the
+ring's mid-radius: all 13 slices were classified against their own swatches,
+95.31% of the ring was painted and the remaining 4.69% was the thirteen gaps, SHV
+measuring 10.22% of the ring against its 10.78% of the book and the tail 51.42%
+against its 52.03%. The block does not move with the table's arguments either:
+`sort=weight` and `sort=loss&limit=25` returned the same twelve `largest` rows as
+`sort=value` did. Switching the quarter moved the ring with the page — `2022-03-31`
+gave a centre of `$107.82M / 69 positions` against the API's `107819533` and 69,
+first slice `XLP`, under the caption `the filing's own book at 2022 Q1` — so the
+ring reads the selected quarter and not the newest filing. It is also the panel
+that survives a fund the rest of the page cannot draw: `0000891943`'s
+794-position single filing had no positions table, no sort select and a sentence
+where each canvas would be, and the ring still drew `$1.5B / 794 positions` with
+13 arcs and a `782 others | 73.85% | $1.11B` tail. At an 820 px window the panel
+wrapped to the donut over a two-column legend with no horizontal overflow, and no
+console or page error appeared on any of those passes.
 
 The branches that are not the happy path were driven too, on the same real
 dataset. `0000891943` — 794 positions, one filing — showed `794 positions · 2024 Q2

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import FundPicker from './FundPicker.jsx';
+import HoldingsPie from './HoldingsPie.jsx';
 import PositionBars from './PositionBars.jsx';
 import QuarterChart from './QuarterChart.jsx';
 import { Badge, ACTION_TONE } from './Badge.jsx';
@@ -336,6 +337,18 @@ export default function Funds() {
                 </figure>
               )}
             </div>
+          </section>
+        ) : null}
+
+        {payload ? (
+          <section className="section">
+            <header>
+              <h2>Holdings</h2>
+              <span className="muted">
+                the filing's own book at {period(payload.period)} · by reported value, largest first
+              </span>
+            </header>
+            <HoldingsPie holdings={payload.holdings} />
           </section>
         ) : null}
 

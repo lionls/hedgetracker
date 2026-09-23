@@ -10,7 +10,7 @@ package main
 //	/api/13f/flows      fund_quarterly_flows, the period-over-period changes
 //	/api/13f/signals    conviction_scores, across funds, one ticker, or one fund
 //	/api/13f/vwap       market_quarterly_vwap for one ticker
-//	/api/13f/fund       one fund's quarter series and its marked positions
+//	/api/13f/fund       one fund's quarter series, its marked positions, its book
 //	/api/13f/refresh    rebuild the tables from the lake
 //
 // Rows are objects rather than the column arrays the price bars use: these
@@ -163,6 +163,37 @@ type FundPositionRow struct {
 	PnlPct           *float64 `json:"pnlPct"`
 	CumulativePnlUSD *float64 `json:"cumulativePnlUsd"`
 	Priced           bool     `json:"priced"`
+}
+
+// holdingSlices is how many of a fund's positions the holdings panel is handed by
+// name. A donut names about a dozen slices before its legend stops fitting beside
+// it, and a book of 794 positions is not a chart: everything past the cut is one
+// tail slice, whose size and count are in the same response, so the panel never
+// draws a book it did not receive.
+const holdingSlices = 12
+
+// FundHoldingRow is one slice of a fund's reported book: a position of the filing
+// by value, with the weight the filing implies. It is the quarter the page is on,
+// which is what "current holdings" means for a 13F — the series is the charts.
+type FundHoldingRow struct {
+	Cusip     string  `json:"cusip"`
+	Ticker    string  `json:"ticker"`
+	Issuer    string  `json:"issuer"`
+	ValueUSD  float64 `json:"valueUsd"`
+	WeightPct float64 `json:"weightPct"`
+}
+
+// FundHoldings is the quarter's book as the holdings panel needs it: the largest
+// positions by reported value, and the whole book's count and value, so the panel
+// can draw what this list does not name as one tail slice. It reads
+// holdings_normalized rather than the movement rows, because a position the fund
+// exited is a row of position_quarter_pnl with nothing left in it and a book does
+// not hold those — which is also why positions and the series row's `positions`
+// are the same number.
+type FundHoldings struct {
+	Largest   []FundHoldingRow `json:"largest"`
+	Positions int64            `json:"positions"`
+	ValueUSD  float64          `json:"valueUsd"`
 }
 
 var (
@@ -552,14 +583,15 @@ var thirteenSorts = []struct{ name, order string }{
 }
 
 // thirteenfFund is one fund's page in one request: the quarter series from
-// fund_quarterly_performance, and the positions of one quarter from
+// fund_quarterly_performance, the positions of one quarter from
 // position_quarter_pnl with the P&L the quarterly VWAPs imply — each of those
 // rows carrying the same marks summed per CUSIP through that quarter, so it can
-// say what the position has done, not only what it did this quarter. The series
-// is every filing the fund is in the lake for — the charts are the page — while
-// the positions answer for the quarter the request names, newest by default. A
-// filer whose first filing is the requested one has an empty positions list and a
-// series that still states what the filing was worth.
+// say what the position has done, not only what it did this quarter — and the
+// quarter's book from holdings_normalized, largest first, for the holdings panel.
+// The series is every filing the fund is in the lake for — the charts are the
+// page — while the positions answer for the quarter the request names, newest by
+// default. A filer whose first filing is the requested one has an empty positions
+// list and a series that still states what the filing was worth.
 func (a *API) thirteenfFund(w http.ResponseWriter, r *http.Request) {
 	path, ok := a.thirteenF.tablePath(w, thirteenPositionPnl)
 	if !ok {
@@ -573,6 +605,11 @@ func (a *API) thirteenfFund(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	book, ok := a.thirteenF.tablePath(w, thirteenHoldings)
+	if !ok {
+		return
+	}
+	bookFrom := thirteenFrom(book)
 	cik, ok := cikParam(w, r)
 	if !ok {
 		return
@@ -675,6 +712,40 @@ func (a *API) thirteenfFund(w http.ResponseWriter, r *http.Request) {
 		a.thirteenFailed(w, "fund", err)
 		return
 	}
+
+	// The book the holdings panel draws: the filing's own positions, largest
+	// first, with the whole book's count and value beside them. The panel needs
+	// the book rather than this response's `positions`, which are the movement
+	// rows — an exited position is a row of those with nothing left in it — and
+	// it needs them whole rather than as the page of rows the table asked for,
+	// because a ranking is not a composition.
+	largestQuery := fmt.Sprintf(`SELECT cusip, ticker, issuer, value_usd, portfolio_weight_pct
+		FROM %s WHERE cik = ? AND report_period = ? ORDER BY value_usd DESC, cusip LIMIT %d`,
+		bookFrom, holdingSlices)
+	holdings := FundHoldings{Largest: []FundHoldingRow{}}
+	if err := a.thirteenRows(r.Context(), largestQuery, []any{cik, period}, func(rs *sql.Rows) error {
+		var row FundHoldingRow
+		if err := rs.Scan(&row.Cusip, &row.Ticker, &row.Issuer, &row.ValueUSD, &row.WeightPct); err != nil {
+			return err
+		}
+		holdings.Largest = append(holdings.Largest, row)
+		return nil
+	}); err != nil {
+		a.thirteenFailed(w, "fund", err)
+		return
+	}
+	if err := a.thirteenCount(r.Context(),
+		fmt.Sprintf("SELECT count(*) FROM %s WHERE cik = ? AND report_period = ?", bookFrom),
+		[]any{cik, period}, &holdings.Positions); err != nil {
+		a.thirteenFailed(w, "fund", err)
+		return
+	}
+	if err := a.thirteenCount(r.Context(),
+		fmt.Sprintf("SELECT COALESCE(SUM(value_usd), 0) FROM %s WHERE cik = ? AND report_period = ?", bookFrom),
+		[]any{cik, period}, &holdings.ValueUSD); err != nil {
+		a.thirteenFailed(w, "fund", err)
+		return
+	}
 	// An aggregate rather than a row: a lake the extractor has not named has no
 	// row for the fund at all, which leaves the name empty rather than failing.
 	var filerName string
@@ -688,7 +759,7 @@ func (a *API) thirteenfFund(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"cik": cik, "filerName": filerName, "period": period, "sort": sort,
 		"quarters": quarters, "series": series, "total": total, "limit": limit,
-		"positions": positions,
+		"positions": positions, "holdings": holdings,
 	})
 }
 
