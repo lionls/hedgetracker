@@ -6,6 +6,7 @@
 // needs to stay readable.
 const money = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 2 });
 const plain = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 });
+const precise = new Intl.NumberFormat('en-US', { maximumFractionDigits: 3 });
 
 function signed(value, format) {
   if (value === null || value === undefined) return '—';
@@ -49,6 +50,15 @@ export function plural(value, noun) {
 export function percent(value) {
   if (value === null || value === undefined) return '—';
   return `${plain.format(value)}%`;
+}
+
+// precisePercent is percent for a share of a whole that can sit far below one:
+// the tracked funds of the ownership panel against a company whose share count
+// runs to the billions is 0.002%, which the two-digit formatter would render as
+// the untruth "0%". Above one percent the two agree.
+export function precisePercent(value) {
+  if (value === null || value === undefined) return '—';
+  return `${(value < 1 ? precise : plain).format(value)}%`;
 }
 
 export function signedPercent(value) {

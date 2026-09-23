@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import Chart from './Chart.jsx';
 import Fundamentals from './Fundamentals.jsx';
+import InstitutionalOwnership from './InstitutionalOwnership.jsx';
 import Pages from './Pages.jsx';
 import { companyFor, historyFor, searchSymbols, sliceHistory, stocksList } from './api.js';
 
@@ -225,6 +226,8 @@ export default function App({ page = 'explorer' }) {
         </section>
 
         {stocksOnly ? <Fundamentals symbol={symbol} /> : null}
+
+        {stocksOnly ? <InstitutionalOwnership symbol={symbol} /> : null}
 
         <section className="company">
           <dl>
