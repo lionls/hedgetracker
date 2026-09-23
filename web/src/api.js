@@ -177,6 +177,34 @@ export function thirteenOwners(ticker, period = '') {
   return getJSON(`/13f/owners?${query({ ticker, period })}`);
 }
 
+// thirteenConsensus answers the consensus board: one quarter of the whole lake as
+// four lists — the companies the most funds opened, the companies the most funds
+// left, the quarter's largest net flows, and the companies the tracked funds own
+// the largest share of. The quarter is the lake's newest unless one is named, and
+// the response carries every quarter the lake holds. The board compares funds to
+// each other, so no fund is selected on the page that reads it.
+export function thirteenConsensus(period = '', limit = 25) {
+  return getJSON(`/13f/consensus?${query({ period, limit })}`);
+}
+
+// thirteenLeaderboard is the fund directory: every filer in the lake with the
+// size and concentration of its newest filing, its estimated turnover and marks
+// for the quarter, and the same over the last four and twelve filings. An empty
+// sort is the server's first ranking — largest fund first.
+export function thirteenLeaderboard(sort = '', limit = 50) {
+  return getJSON(`/13f/leaderboard?${query({ sort, limit })}`);
+}
+
+// thirteenCompare puts two filers side by side for one quarter: what each filed,
+// the capital the two books share, the positions they hold in common with each
+// side's weight and estimated basis, and the positions one side opened or added
+// to while the other trimmed or left. An empty period is the newest quarter both
+// funds filed, and the response carries every quarter they share; a pair that
+// shares none answers with no period and empty lists.
+export function thirteenCompare(a, b, period = '') {
+  return getJSON(`/13f/compare?${query({ a, b, period })}`);
+}
+
 // thirteenRefresh answers 202 when it started a build and 409 when one is
 // already running. Both bodies are the status, and both are states the
 // dashboard renders rather than errors, so neither is thrown: the status it
