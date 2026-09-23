@@ -594,6 +594,99 @@ body {
   min-height: 260px;
 }
 
+/* The holdings donut: the book as one ring, the largest positions named beside
+   it and everything else as one muted slice. The centre is an element rather
+   than SVG text, which keeps it crisp at whatever width the panel takes. */
+.holdings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px 28px;
+  align-items: center;
+  padding: 4px 0 8px;
+}
+
+.donut {
+  position: relative;
+  width: 188px;
+  height: 188px;
+}
+
+.donut svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.donut-track {
+  stroke: rgba(35, 42, 53, 0.45);
+}
+
+/* A slice is a stroke, not a filled path, so the ring is the one hover target
+   that has to say which slice is under the pointer. */
+.donut-slice:hover {
+  opacity: 0.82;
+}
+
+.donut-centre {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  pointer-events: none;
+}
+
+.donut-centre strong {
+  font-size: 17px;
+  font-variant-numeric: tabular-nums;
+}
+
+.donut-centre span {
+  font-size: 11px;
+}
+
+/* Two columns when the panel is wide enough for them, one when it is not: a
+   794-position book names twelve slices and a tail, and a legend of thirteen
+   rows beside the ring is taller than the ring. */
+.donut-legend {
+  flex: 1 1 300px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
+  gap: 0 24px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.donut-legend li {
+  display: grid;
+  grid-template-columns: 9px minmax(0, 1fr) 52px 66px;
+  gap: 8px;
+  align-items: center;
+  padding: 3px 0;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.donut-swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+}
+
+.donut-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.donut-share,
+.donut-value {
+  text-align: right;
+}
+
 /* The quarter's P&L per position: one row per mark, the bar drawn out from the
    axis at the centre of the track, so gains and losses read as one distribution
    and the axis stays put as the page changes quarter. */

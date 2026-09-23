@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import FundPicker from './FundPicker.jsx';
+import HoldingsPie from './HoldingsPie.jsx';
 import PositionBars from './PositionBars.jsx';
 import QuarterChart from './QuarterChart.jsx';
 import { Badge, ACTION_TONE } from './Badge.jsx';
@@ -342,6 +343,18 @@ export default function Funds() {
         {payload ? (
           <section className="section">
             <header>
+              <h2>Holdings</h2>
+              <span className="muted">
+                the filing's own book at {period(payload.period)} · by reported value, largest first
+              </span>
+            </header>
+            <HoldingsPie holdings={payload.holdings} />
+          </section>
+        ) : null}
+
+        {payload ? (
+          <section className="section">
+            <header>
               <h2>P&amp;L by position</h2>
               <span className="muted">
                 biggest marks of {period(payload.period)} · gains right of the axis, losses left
@@ -401,6 +414,7 @@ export default function Funds() {
                       <th scope="col">Weight</th>
                       <th scope="col">P&amp;L</th>
                       <th scope="col">P&amp;L %</th>
+                      <th scope="col">P&amp;L since then</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -446,6 +460,14 @@ export default function Funds() {
                         <td className={tone(position.pnlPct)}>
                           {signedPercent(position.pnlPct)}
                         </td>
+                        <td
+                          className={tone(position.cumulativePnlUsd)}
+                          title={`the same marks summed from the position's first filing in the lake through ${period(
+                            payload.period,
+                          )} — a position held for several quarters carries all of them, and one the fund has bought back carries the spell before it too`}
+                        >
+                          {signedDollars(position.cumulativePnlUsd)}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -471,8 +493,13 @@ export default function Funds() {
             mean close, on the split-adjusted shares held at the previous filing — bought and sold
             at the VWAP the filing is marked at. A position opened this quarter is marked at what
             it is held at, so it contributes nothing; an exit is valued at the quarter&apos;s VWAP
-            rather than at the price it was sold at, which the filing does not carry. Positions the
-            price dataset does not cover are counted rather than zeroed: this quarter&apos;s marks
+            rather than at the price it was sold at, which the filing does not carry. P&amp;L since
+            then sums those marks per position over the fund&apos;s filings through the selected
+            quarter — per CUSIP, so a position the fund sold and later bought back carries both
+            spells — which is the fund&apos;s own running total asked per row: the rows of this
+            table cannot add up to that total, because a position the fund exited before this
+            quarter is in the total and not in the table. Positions the price dataset does not
+            cover are counted rather than zeroed: this quarter&apos;s marks
             cover {percent(row.coveragePct)} of the reported value, and a quarter between two
             filings further apart than three months carries the whole gap&apos;s mark. No fees,
             dividends or intraday prices are in any of it.
