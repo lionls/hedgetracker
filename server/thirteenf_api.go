@@ -1687,12 +1687,24 @@ func (a *API) thirteenfLeaderboard(w http.ResponseWriter, r *http.Request) {
 	// The marks come from fund_quarterly_performance, one row per filing, and the
 	// windows are the filings themselves — a fund that skips a quarter has fewer
 	// rows in the window, which is what yearFilings and threeYearFilings report.
+	//
+	// The ranking window must see only the filings the answer uses. DuckDB holds
+	// every row a window sees, so ranking the whole book made this page's memory
+	// grow with the lake: a fifty-row page needed the whole book resident, and
+	// the lake in the server log that failed was 3.7 GiB. The semi join carries
+	// the same predicate as the LEFT JOIN below, so top10 keeps exactly the rows
+	// it is asked for, and its input is the funds' newest filings rather than the
+	// book: 375,000 rows on a 3,000,000-position lake and 375,000 again on a
+	// 15,000,000-row lake with forty quarters. The unrestricted window failed at
+	// an 80 MB limit on the first and a 128 MB limit on the second; this one
+	// passes at 64 MB on both.
 	query := fmt.Sprintf(`WITH top10 AS (
 			SELECT cik, report_period, SUM(portfolio_weight_pct) AS top10_pct FROM (
-				SELECT cik, report_period, portfolio_weight_pct,
-					row_number() OVER (PARTITION BY cik, report_period
-						ORDER BY value_usd DESC, cusip) AS rk
-				FROM %s
+				SELECT h.cik, h.report_period, h.portfolio_weight_pct,
+					row_number() OVER (PARTITION BY h.cik, h.report_period
+						ORDER BY h.value_usd DESC, h.cusip) AS rk
+				FROM %s h
+				SEMI JOIN %s f ON f.cik = h.cik AND f.latest_period = h.report_period
 			) WHERE rk <= 10
 			GROUP BY cik, report_period
 		),
@@ -1724,7 +1736,7 @@ func (a *API) thirteenfLeaderboard(w http.ResponseWriter, r *http.Request) {
 		LEFT JOIN top10 t ON t.cik = f.cik AND t.report_period = f.latest_period
 		LEFT JOIN marks m ON m.cik = f.cik AND m.report_period = f.latest_period
 		ORDER BY %s
-		LIMIT %d`, book, performanceFrom, fundFrom, order, limit)
+		LIMIT %d`, book, fundFrom, performanceFrom, fundFrom, order, limit)
 
 	rows := []LeaderboardRow{}
 	if err := a.thirteenRows(r.Context(), query, nil, func(rs *sql.Rows) error {
