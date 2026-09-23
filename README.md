@@ -557,6 +557,7 @@ Three properties of the serving path matter to a client:
 | `GET /api/13f/flows?cik=2038506&action=NEW,ADDED` | `{"cik":"0002038506","period":"","actions":[…],"total":389,"flows":[{"cik":"0002038506","period":"2024-06-30","prevPeriod":"2024-03-31","quartersBetween":1,"cusip":"595112103","ticker":"MU","issuer":"MICRON TECHNOLOGY INC","action":"NEW","shares":17554,"valueUsd":2308878,"weightPct":1.7611,"prevShares":0,"deltaShares":17554,"deltaSharesPct":null,"deltaWeightPct":1.7611,"splitFactor":1,"splitAdjusted":false},…]}`; without `period` it reports the fund's whole history, newest first |
 | `GET /api/13f/signals?period=2024Q2&signal=HIGH_CONVICTION_BUY` | the flow shape plus `signal`, `quarterlyVwap`, `quarterlyLow`, `quarterlyHigh`, `estCapitalFlow` and `filerName`. The filters are `cik`, `ticker`, `period`, `action` and `signal`, and `period=latest` is the default; with no filters it answers the lake's newest quarter, largest estimated flow first, and for one fund and ticker it is the position: `?cik=2038506&period=2024Q2&ticker=NVDA` is `{"action":"TRIMMED","shares":20139,"prevShares":21720,"deltaShares":-1581,"splitFactor":10,"splitAdjusted":true,"weightPct":1.8977,"signal":"PASSIVE_REBALANCE","quarterlyVwap":100.3169,"estCapitalFlow":-158601}` |
 | `GET /api/13f/flow?cik=2038506&period=2024-06-30` | `{"cik":"0002038506","filerName":"","period":"2024-06-30","prevPeriod":"2024-03-31","quartersBetween":1,"slices":12,"quarters":[…11 dates…],"previous":{"period":"2024-03-31","positions":69,"valueUsd":133597275},"current":{"period":"2024-06-30","positions":67,"valueUsd":131104358},"positions":[{"cusip":"464288679","ticker":"SHV","issuer":"ISHARES TR","action":"TRIMMED","prevValueUsd":14244471,"valueUsd":14126679,"prevWeightPct":10.6622,"weightPct":10.7751,"estFlowUsd":null,"splitAdjusted":false},…15 rows…],"others":{"prevPositions":55,"positions":53,"prevValueUsd":67219626,"valueUsd":64911353,"estFlowUsd":3828842,"unpriced":10}}` — the two books of one transition, side by side: the named rows are the union of each side's `slices` largest positions — an exit that was one of the left book's big names is named even though the right side does not hold it — ordered largest first by whichever of its two values is bigger, and each carries only what a band needs (the two values, the two weights, the action and the estimated trade, `null` where the ticker has no price bars); `others` is the aggregated tail, so the named rows plus `others` add up to `previous.valueUsd` and to `current.valueUsd` exactly. `period` takes a date, a quarter label or `latest`; a fund with one filing, or its own earliest filing, answers `"previous":null` and no positions, and `filerName` is `""` on an unnamed lake |
+| `GET /api/13f/owners?ticker=NVDA` | `{"symbol":"NVDA","period":"2024-06-30","limit":100,"total":6,"summary":{"holders":6,"shares":574696,"valueUsd":71177309,"trackedAumUsd":2717846893,"aumPct":2.618885897631762,"outstandingShares":24598342000,"ownedPct":0.0023363200657995566,"boughtShares":3603,"soldShares":1581,"netShares":2022,"buyingFunds":1,"sellingFunds":1,"exits":0,"unpricedFunds":4},"holders":[{"cik":"0001661222","filerName":"","shares":235246,"valueUsd":29241000,"weightPct":12.3482,"action":"","deltaShares":0,"deltaWeightPct":0,"splitAdjusted":false,"buyQuarters":0,"boughtShares":0,"estCostPerShare":null,"estCostUsd":null},…]}` — the stocks page's institutional half: the funds holding one ticker, and what that cohort adds up to. `holders` is one row per fund still holding the name, ordered by the weight the position is of that fund's own book, and `total` counts what `limit` cut. `action` is what the fund's own previous filing makes of the position — `""` is not `HELD`: this quarter is that fund's first filing in the lake, so there is no previous book to have moved from — `splitAdjusted` says the share delta had a split undone, and `estCostPerShare` is the average VWAP of the quarters the fund bought in. `summary` is the cohort: its shares and filed value, that value's share of what every tracked fund reports for the quarter (`trackedAumUsd`), the net share change with a count of the funds on each side, and the cohort's shares over the company's own count. `outstandingShares`, and so `ownedPct`, is absent when the market table has no count for the symbol; `unpricedFunds` counts holders with nothing to price a basis from. `?period=` takes a date or a quarter label and defaults to the lake's newest, and the ticker is matched the way the views normalise it, so `BRK-B` finds the lake's `BRKB`. |
 | `GET /api/13f/fund?cik=2038506&period=2024-06-30&sort=value&limit=2000` | `{"cik":"0002038506","filerName":"","period":"2024-06-30","sort":"value","quarters":[…11 dates…],"series":[…11 rows…],"total":81,"limit":2000,"positions":[…81 rows…]}` — one row per filing in `series`, the cursor's quarter named by `period`, and the same row spelled out: `{"period":"2024-06-30","reportYear":2024,"reportQuarter":2,"prevPeriod":"2024-03-31","quartersBetween":1,"positions":67,"portfolioValueUsd":131104358,"movedPositions":81,"positionsWithPnl":63,"pnlUsd":-708441,"cumulativePnlUsd":-21396093,"coveredValueUsd":70700295,"coveragePct":53.9267,"newPositions":12,"addedPositions":27,"trimmedPositions":23,"exitedPositions":14,"heldPositions":5,"purchasedUsd":19978177.83,"soldUsd":17100750.04,"purchasedPositions":30,"soldPositions":29}`. Each position is the flow shape plus the mark: `{"cusip":"67066G104","ticker":"NVDA","issuer":"NVIDIA CORP","action":"TRIMMED","shares":20139,"valueUsd":2487972,"weightPct":1.8977,"prevShares":21720,"deltaShares":-1581,"deltaValueUsd":525440,"quartersBetween":1,"splitFactor":10,"splitAdjusted":true,"prevVwap":74.003,"vwap":100.3169,"pnlUsd":571538,"pnlPct":35.5579,"cumulativePnlUsd":695234,"priced":true}` — `pnlUsd` is the split-adjusted `prevShares × (vwap − prevVwap)`, so the dataset's adjusted VWAPs carry the split and our `splitFactor` carries the shares, and `cumulativePnlUsd` is the same marks summed per CUSIP over the fund's filings through `period` — the fund's own running total asked per position, `null` where none of the position's marked quarters had a price. `period` takes a date, a quarter label or `latest`, and defaults to the newest filing; `sort` is one of `value`, `weight`, `gain`, `loss` and anything else is a `400`; `limit` (default 100, capped at 2000) cuts `positions` while `total` keeps the whole count — and beside them `"holdings":{"largest":[{"cusip":"464288679","ticker":"SHV","issuer":"ISHARES TR","valueUsd":14126679,"weightPct":10.7751},…],"positions":67,"valueUsd":131104358}`, the quarter's book from `holdings_normalized`, largest first, which is the whole of what the funds page's donut draws |
 | `GET /api/13f/vwap?ticker=NVDA` | `{"ticker":"NVDA","quarters":[{"symbol":"NVDA","year":2024,"quarter":2,"tradingDays":63,"firstTradeDate":"2024-04-01","lastTradeDate":"2024-06-28","totalVolume":27164691100,"vwap":100.3169,"low":75.606,"high":140.76},…]}` — newest quarter first, up to `limit` (default 40, capped at 400), so the cap drops the oldest quarters of a long history rather than the newest |
 | `POST /api/13f/refresh` | `202` with the status body, or `409` with it while a build is running |
@@ -575,7 +576,10 @@ every panel on it reads the same `series` array and splitting that into five
 requests would let the panels disagree with each other. The
 [flow page](#the-flow-page) adds one, `/flow?cik=…&period=…`, for the same reason
 in the other direction: its two columns are two filings, and a band read from one
-response cannot disagree with the book read from another.
+response cannot disagree with the book read from another. The
+[stocks page](#the-stocks-page) adds `/owners?ticker=…`, the one 13F call a page
+of market data makes: the roster and the cohort totals are one response, so the
+badges and the table cannot disagree about which funds they are counting.
 
 Six things the numbers mean, which the SQL file argues in full:
 
@@ -613,7 +617,10 @@ Six things the numbers mean, which the SQL file argues in full:
   `0` and carries a `null` percentage, because there is no earlier price to move
   from; an exit is marked at the current quarter's VWAP, since that is the price the
   dataset has when the position is gone. `quartersBetween > 1` puts the whole gap's
-  move into the quarter that reports it.
+  move into the quarter that reports it. The ownership panel's estimated cost basis
+  is the same idea asked the other way: the share-weighted VWAP of the quarters the
+  fund bought the position in, so a fund with no purchase in the lake's window has
+  none to show.
 * **A missing price is a coverage number, not a failure.** The dataset has no bars
   for delisted names — `TWTR`, `ATVI` — so `priced` is `false` and the mark is
   `null`, never a zero that would read as "this position did not move".
@@ -636,9 +643,11 @@ marked at all.
 
 `/stocks` is the same app in a second mode: same chart, same company card, same
 search, restricted to operating companies, with the selected symbol's financial
-statements between the chart and the company card. It exists because the index
+statements between the chart and the company card and the 13F funds that hold it
+underneath them. It exists because the index
 does not distinguish an equity from a SPAC unit, a preferred class or an ETF, and
-because none of the statement tables were reachable from the page at all.
+because none of the statement tables were reachable from the page at all — nor
+was anything the filings half of the app knows about a stock.
 
 **What counts as a stock.** The dataset states no `quote_type`, so the filter is
 what the profile table allows: a symbol survives if `stock_profile` gives it a
@@ -680,14 +689,50 @@ literal
 twelve-month window as a year. A symbol with no statements — every fund — says so
 instead of showing an empty table.
 
+**The ownership panel.** Below the statements the same page answers the filings
+half of the symbol: `GET /api/13f/owners?ticker=…` returns the funds that hold it
+and the cohort's totals in one response, and the four badges read the totals while
+the table reads the rows. The badges are the cohort's shares, what they are of
+everything the tracked funds report for the quarter, the quarter's net share change
+with a count of the funds on each side, and the cohort's shares over the count the
+market table reports at that quarter's end — the market half of the app carries
+shares outstanding and no float, so the badge names the denominator it really
+divides by and the note under the table says so: nothing on this page is a float
+percentage. The cost basis is an estimate and says how it is made, because a 13F
+states none: the server averages the quarterly VWAPs of the quarters this fund
+*bought* the position in, over the window the lake covers, ignoring what it sold,
+and the cell's title names those quarters and the price the filing itself values
+the position at. A fund with no purchase in that window reads a dash — four of the
+six funds holding `NVDA` at 2024 Q2, which is the shape of a fixed cohort: the
+funds that file only that quarter have no previous book to compare against and no
+purchase to price. The roster is the funds still holding the name, a fund that left
+it counted in the flow and not in the table, and the rows are ordered by the weight
+the position is of the fund's own book rather than by size, so the table lines the
+funds up by what the position is worth to *them*. The names come from the lake's
+`filer_name`, which this lake leaves empty, so each row reads `CIK 0002032121`; a
+symbol no tracked fund holds — `AA` here — says so in a sentence rather than
+drawing an empty table, because the cohort is a fixed set of filers and a missing
+name is the ordinary case.
+
 The panel sits between the chart and the company card rather than at the bottom of
 the column, which is a layout decision with a number behind it: at the end of the
 column it began 651 px down on a 1440×768 window — chart at its 380 px minimum,
 then the company card — which is past the fold entirely on a 600 px-tall window,
 and a column that scrolls without a scrollbar gives no hint that anything is
-there. Above the card it starts at 479 px, so the heading, the figures and the
-first table are on screen without scrolling at every window height tested from 600
-to 1100 px.
+there. Above the card it starts at 479 px, and what is *in view* inside that box
+is a second question: the sections are flex items sharing the leftover height of
+a column that is exactly one window tall, and each one carries `overflow-x: auto`
+— which computes to `overflow-y: auto` — so a section's own box is only the part
+of the leftover it was given, and the rest of its content sits in an inner scroll
+area with no visible scrollbar. Measured on 2026-09-23 at 1440 px wide, against
+846 px of statement content the statements panel's box is 249 px at a 900 px-tall
+window, 117 px at 768 and 45 px at 600, so the heading and the figures are in view
+and the statement tables are not: the boxes are the on-screen part, the rest is a
+scroll the page gives no hint of. (On the 2026-09-22 sweep the numbers were read
+off the section's own offsets, which is why they read as if the tables were in
+view; the boxes say otherwise.) The one-column layout below 900 px wide is not
+squeezed at all — the page scrolls normally there — so it is the wide layout that
+loses content to the inner scroll.
 
 The same sweep found the second layout, which had the same fault: below 900 px
 wide the grid collapses to one column and the sidebar is stacked over the chart,
@@ -697,6 +742,19 @@ its 380 px minimum; a minimum cannot shrink it, because the canvas is laid out a
 its initial height and holds the panel open. In that layout the figures sit at
 664 px in the same window, and the panel is the first thing under the chart in
 both layouts rather than the last thing in the column.
+
+The ownership panel below it inherits all of that and takes part of the leftover
+from the statements: at 1440 px wide and a 900 px-tall window the statements box
+falls from 249 px to 148 px and the ownership box gets 101 px of its 475 px of
+content; at 768 px tall they are 63 px and 54 px, at 600 px both are 45 px. So the
+four badges are in view from a 900 px-tall window up, the first roster row only at
+1100 px (its box is 170 px there), and in between the table is behind the section's
+own scroll — reachable, since the panel's scroll extent is real (`scrollTop` 375 of
+a 375 px overflow at 1440×900) but signalled by nothing. The company card is the
+fixed point in this: it starts at 728 px at 1440×900 with the panel and without it,
+because the sections absorb the new one rather than the column growing. In the
+one-column layout there is no squeeze and no inner scroll: at 900×768 the panel is
+504 px of content in a 504 px box, painted whole.
 
 The read is per symbol and cached in the process like the bars are, so a second
 visitor to a symbol pays 0.5 ms. The first one pays for the statements and one
@@ -984,7 +1042,8 @@ and compress the bundle in front of the container if that matters. Only
 
 Against the running server on 2026-09-15, over the proxy this sandbox uses (the
 `/fund` rows, the price-panel row, the `/flow` rows and the bundle row were
-re-measured on 2026-09-23, and the 13F build row on both days; the boot rows are
+re-measured on 2026-09-23 — that day also added the `/owners` row and the
+ownership panel's layout — and the 13F build row on both days; the boot rows are
 the 2026-09-22 run):
 
 | Step | Measured |
@@ -1008,7 +1067,8 @@ the 2026-09-22 run):
 | Boot: the 13F build over the 25-file smoke lake with the real price dataset | 205.9 s on the 2026-09-22 run, 207.2 s on the 2026-09-23 one — index warm 3.7 s, 12,333 priced symbols in 36.5 s, then the six tables |
 | `GET /api/13f/vwap?ticker=NVDA`, the price panel's query | 11 rows over the 2021 Q4 – 2024 Q2 window the lake covers, newest quarter first; `limit=5` keeps 2024 Q2 … 2023 Q2, so a cap cuts the oldest rows |
 | `GET /api/13f/flow?cik=2038506&period=2024-06-30`, the flow page's read | 3,586 B — 15 named rows against `previous {69, $133,597,275}` and `current {67, $131,104,358}` with the tail's 55 and 53 positions behind `others`; 8–14 ms across five reads of the same quarter, and 317 B / 6 ms for `0000891943`, whose single filing answers `"previous":null` and draws nothing |
-| `npm run build`, the five pages | 0.23 s — 443.19 kB JS (137.81 kB gzipped), 9.46 kB CSS (2.45 kB gzipped); the donut is 2.53 kB of the JS and 0.98 kB of the CSS, and the flow page is the 11.63 kB of JS the build grew by when it and its route were added, of which `Sankey.jsx` is 8,793 B minified on its own (8,793 B / 3,242 B gzipped with `bun build`, react external) |
+| `GET /api/13f/owners?ticker=NVDA`, the ownership panel's read | 1,820 B — six holders and the cohort's summary; 16–20 ms over four warm reads of it (19.5, 19.6, 17.4, 16.0 ms), and 2.01 s on the first call after a restart, which pays for the tables and the market read behind `ownedPct`. `?limit=2` cuts the roster to 833 B, and a symbol no tracked fund holds (`AA`) answers 309 B |
+| `npm run build`, the five pages | 0.22 s — 448.06 kB JS (139.39 kB gzipped), 9.46 kB CSS (2.45 kB gzipped); the donut is 2.53 kB of the JS and 0.98 kB of the CSS, the flow page is the 11.63 kB of JS the build grew by when it and its route were added, of which `Sankey.jsx` is 8,793 B minified on its own (8,793 B / 3,242 B gzipped with `bun build`, react external), and the ownership panel is the next 4.81 kB of JS — the same tree built with its mount line commented out is 443.25 kB (137.84 kB gzipped) — with the stylesheet untouched |
 
 ### Why it is shaped this way
 
@@ -1094,11 +1154,14 @@ the count `8,643 stocks`, sector `Technology` narrows that to 1,146 rows, *Show
 cap `$2.01B`, P/E `—` because its trailing EPS is negative), and `coca` selects
 `KO`, whose panel reads `Market cap $384.47B` (`4.30B × 89.35`), `Trailing EPS
 3.32`, `P/E 26.92` and three statement tables of 7, 5 and 3 rows, `Revenue
-$47.94B $47.06B $45.75B $43B $38.66B` in the first. The panel starts 479 px down
-the column, so the heading, the figures and the first table are on screen without
-scrolling at 600, 768, 900 and 1100 px of window height. Switching symbols brings
-the figures with the statements rather than after them: `AAGH` reads `Market cap
-$4.23M` and `Shares outstanding 21.15B` from the same response, with dashes for
+`$47.94B $47.06B $45.75B $43B $38.66B` in the first. The panel starts 479 px down
+the column at every window height tested from 600 to 1100 px; the height of the
+box it starts in is a separate reading, and on 2026-09-23 it was 249 px at a
+900 px-tall window against 846 px of content — the statements below the figures
+are inside the section's own scroll, as the layout note above records. Switching
+symbols brings the figures with the statements rather than after them: `AAGH`
+reads `Market cap $4.23M` and `Shares outstanding 21.15B` from the same response,
+with dashes for
 trailing EPS and P/E, which is what the dataset holds for it — 36 of 39 sampled
 stocks carry a trailing EPS, and the gap sits in the small listings. The narrow
 layout was swept too, and the figures are fully in view at 900, 820, 768 and 700
@@ -1111,6 +1174,35 @@ filter, no count and no fundamentals panel, keeps its headline, chart, company
 card order, and its chart still fills the column (497 px at 1440×768).
 `npm run dev` on `:5173` serves the page
 and proxies `/api` to the Go process, checked with `curl` through the dev server.
+
+The ownership panel was driven the same way, and its figures were checked against
+the endpoints that produce them rather than against itself. `AAPL` reads `6
+tracked funds holding AAPL in 2024 Q2` over four badges — `Tracked shares
+360.39K`, `Share of tracked AUM 2.81%`, `Net QoQ flow +2,878 shares` and `Share of
+shares outstanding 0.002%`, the last of them the reason `numbers.js` grew a
+`precisePercent`, since `percent` prints 0.0023% as `0%` — and six rows ordered
+7.6 / 6.7 / 2.78 / 2.63 / 0.658 / 0.332% of their funds' books, two of them
+`ADDED` with the delta in the badge's title and a cost basis whose title names the
+quarters behind it. `NVDA` gives the six rows the API returns, and the cohort's
+arithmetic was recomputed from the other endpoints: the `$2,717,846,893` behind
+`Share of tracked AUM` is the sum the nine funds' own filings report for the
+quarter (`/api/13f/fund` per fund), `2.6189%` is the symbol's `$71,177,309` over
+that sum, and both cost bases are the share-weighted VWAPs of the quarters each
+fund bought in, read quarter by quarter from `/api/13f/signals` and priced with
+`/api/13f/vwap` — `100.3169` over one quarter for `0002032121` and `33.3001` over
+four for `0002038506`, digit for digit what the panel prints. `AA`, a symbol no
+tracked fund holds, renders the sentence rather than an empty table, and `BRK-B`
+finds the lake's `BRKB`. The share count behind the last badge is the company's
+own for the filing quarter: the market table reports 24,598,342,000 at 2024 Q2
+where `/api/fundamentals` reads 24,147,000,000 for its newest period, which is the
+same count at a different date and not a disagreement between the two halves. Two
+failure bodies were rendered as well: a server with no lake configured answers
+`503 {"error":"the 13F tables are being built",…}` and one pointed at an empty
+lake directory answers `503 {"error":"no holdings files under …"}` — the panel
+prints each reason in its `.error` line under the heading, with the chart, the
+statements and the company card still drawn and no loading line left beside it.
+The layout readings are the ones in the section above; this panel was checked on
+the host, and the container image was not rebuilt for it.
 
 The image was then built and run the same way. `docker compose up -d --build
 explorer` takes 48 s here once the base images are pulled — `npm ci` 8 s, `go mod
@@ -1134,11 +1226,11 @@ the same numbers as the host: `/api/stocks` returns 8,643 symbols, 634,481 B,
 with the priced scan still running, then 0.4 ms, with the same five periods,
 `$384.47B` market cap and `26.92` P/E on the page; `SPY` is a `404`; `/stocks` is
 a `200`. The image was rebuilt and checked once more after the close moved into
-the fundamentals response and the narrow layout was fixed: it serves the current
-bundle (`index-dAgGe8Hr.js`), `AAGH` comes back with `close 0.0002` and no
+the fundamentals response and the narrow layout was fixed: that build served
+`index-dAgGe8Hr.js`, `AAGH` comes back with `close 0.0002` and no
 trailing EPS — `$4.23M` market cap, dashes for EPS and P/E on the page — and the
-panel's figures sit 504 px down the column at 1440×768 and 664 px at 900×768,
-above the fold in both, exactly as on the host.
+panel's figures sit 504 px down the column at 1440×768 and 664 px at 900×768 — the
+same offsets as on the host, with the same boxes around them.
 `docker compose --profile explorer down` removes the container and leaves
 the image — without the profile the command silently matches nothing, which is why
 that line carries it.

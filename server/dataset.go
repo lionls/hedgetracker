@@ -741,6 +741,28 @@ func (d *Dataset) marketFigures(ctx context.Context, symbol string) (int64, floa
 	return shares, trailing, close, true
 }
 
+// SharesOutstanding is the company's own share count at or before a date, read
+// from the market dataset because a 13F reports none: the ownership panel divides
+// the shares the tracked funds hold by it. The table carries shares outstanding,
+// not float, so the caller has to name the denominator it is dividing by, and the
+// count is the one reported for that date rather than restated for a later split.
+// The second return is false when the symbol has no count by then, which is a
+// hole a panel states rather than a zero.
+func (d *Dataset) SharesOutstanding(ctx context.Context, symbol, asOf string) (int64, bool) {
+	query := fmt.Sprintf(`SELECT CAST(arg_max(shares_outstanding, CAST(report_date AS DATE)) AS DOUBLE)
+		FROM %s WHERE symbol = ? AND CAST(report_date AS DATE) <= CAST(? AS DATE)`,
+		d.table("stock_shares_outstanding"))
+	var shares sql.NullFloat64
+	if err := d.db.QueryRowContext(ctx, query, symbol, asOf).Scan(&shares); err != nil {
+		log.Printf("dataset: shares outstanding for %s: %v", symbol, err)
+		return 0, false
+	}
+	if !shares.Valid || shares.Float64 <= 0 {
+		return 0, false
+	}
+	return int64(shares.Float64), true
+}
+
 // placeholders returns the "?,?,?" of an IN list of n values; n is always at
 // least one because the specs it is built from are never empty.
 func placeholders(n int) string {

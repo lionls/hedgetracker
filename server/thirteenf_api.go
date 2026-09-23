@@ -12,6 +12,7 @@ package main
 //	/api/13f/vwap       market_quarterly_vwap for one ticker
 //	/api/13f/fund       one fund's quarter series, its marked positions, its book
 //	/api/13f/flow       one fund's book over two filings, as the diagram's bands
+//	/api/13f/owners     the funds holding one ticker: the stocks page's ownership panel
 //	/api/13f/refresh    rebuild the tables from the lake
 //
 // Rows are objects rather than the column arrays the price bars use: these
@@ -998,6 +999,241 @@ func (a *API) thirteenfFlow(w http.ResponseWriter, r *http.Request) {
 		"quartersBetween": quartersApart(prevPeriod, period), "quarters": quarters,
 		"slices": flowSlices, "previous": previous, "current": current,
 		"positions": positions, "others": others,
+	})
+}
+
+// ownerSlices is how many holders the roster names by default: the largest by
+// portfolio weight, which is the one a reader is looking for when a lake holds
+// hundreds of funds. The response carries the roster's true count, so a panel can
+// say what the limit cut.
+const ownerSlices = 100
+
+// OwnerRow is one tracked fund's stake in one company as of one quarter: the
+// position the filing reports, the move the fund's own previous filing makes of
+// it, and the two figures a 13F does not file. A filing states no cost basis
+// (thirteenf.sql deviation 11), so the basis is an estimate — the average VWAP of
+// the quarters the fund bought this position at, over the window the lake covers
+// and ignoring what it sold. estCostPerShare is that average, estCostUsd the same
+// average applied to the shares held now — the basis of the position as it stands
+// — and both are null for a fund that only held. `action` is empty, not HELD,
+// when the fund's first filing in the lake is this quarter: there is no previous
+// filing to compare against rather than no move.
+type OwnerRow struct {
+	Cik             string   `json:"cik"`
+	FilerName       string   `json:"filerName"`
+	Shares          float64  `json:"shares"`
+	ValueUSD        float64  `json:"valueUsd"`
+	WeightPct       float64  `json:"weightPct"`
+	Action          string   `json:"action"`
+	DeltaShares     float64  `json:"deltaShares"`
+	DeltaWeightPct  float64  `json:"deltaWeightPct"`
+	SplitAdjusted   bool     `json:"splitAdjusted"`
+	BuyQuarters     int64    `json:"buyQuarters"`
+	BoughtShares    float64  `json:"boughtShares"`
+	EstCostPerShare *float64 `json:"estCostPerShare"`
+	EstCostUSD      *float64 `json:"estCostUsd"`
+}
+
+// OwnerSummary is the ownership panel's header: what the tracked funds hold
+// together, how much of the cohort's own book that is, and which way the quarter
+// moved them. shares and valueUsd are the roster's holdings — the funds that
+// still hold the name — while netShares is the quarter's flow across every fund
+// in the lake, an exit included, so a name the whole cohort left is a negative
+// flow with an empty roster. ownedPct divides the filed shares by the share count
+// the market dataset reports for the quarter: that table carries shares
+// outstanding, not float, so the panel names what it divides by. outstandingShares
+// and ownedPct are absent when the dataset has no count for the symbol.
+type OwnerSummary struct {
+	Holders           int64    `json:"holders"`
+	Shares            float64  `json:"shares"`
+	ValueUSD          float64  `json:"valueUsd"`
+	TrackedAumUSD     float64  `json:"trackedAumUsd"`
+	AumPct            float64  `json:"aumPct"`
+	OutstandingShares int64    `json:"outstandingShares,omitempty"`
+	OwnedPct          *float64 `json:"ownedPct"`
+	BoughtShares      float64  `json:"boughtShares"`
+	SoldShares        float64  `json:"soldShares"`
+	NetShares         float64  `json:"netShares"`
+	BuyingFunds       int64    `json:"buyingFunds"`
+	SellingFunds      int64    `json:"sellingFunds"`
+	Exits             int64    `json:"exits"`
+	// How many of the holders this roster serves have no estimated basis.
+	UnpricedFunds int64 `json:"unpricedFunds"`
+}
+
+// thirteenfOwners answers the institutional side of the stocks page for one
+// symbol: every tracked fund holding it in one quarter, ranked by how much of the
+// fund's own book the position is, with the summary the panel's badges show. The
+// quarter is the lake's newest — the stocks page has no quarter of its own, so
+// the panel is a snapshot of what the filers last said — and the symbol is
+// matched against the lake's ticker and, where the two sources spell a share
+// class differently, its separator-stripped variant: the bundled CUSIP map writes
+// BRKB where the market dataset writes BRK-B.
+func (a *API) thirteenfOwners(w http.ResponseWriter, r *http.Request) {
+	holdings, ok := a.thirteenF.tablePath(w, thirteenHoldings)
+	if !ok {
+		return
+	}
+	flows, ok := a.thirteenF.tablePath(w, thirteenFlows)
+	if !ok {
+		return
+	}
+	pnl, ok := a.thirteenF.tablePath(w, thirteenPositionPnl)
+	if !ok {
+		return
+	}
+	funds, ok := a.thirteenF.tablePath(w, thirteenFunds)
+	if !ok {
+		return
+	}
+
+	symbol := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("ticker")))
+	if !validSymbol(symbol) {
+		writeError(w, http.StatusBadRequest, "invalid ticker")
+		return
+	}
+	limit := limitParam(r, ownerSlices, 1000)
+
+	tickers := []any{symbol}
+	if stripped := strings.ReplaceAll(symbol, "-", ""); stripped != symbol {
+		tickers = append(tickers, stripped)
+	}
+	in := "IN (" + placeholders(len(tickers)) + ")"
+	book, flowFrom, pnlFrom := thirteenFrom(holdings), thirteenFrom(flows), thirteenFrom(pnl)
+
+	var period string
+	if raw := strings.TrimSpace(r.URL.Query().Get("period")); raw != "" && !strings.EqualFold(raw, "latest") {
+		period, ok = normalisePeriod(raw)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "period must be YYYY-MM-DD or YYYYQn")
+			return
+		}
+	} else {
+		var latest sql.NullTime
+		if err := a.thirteenCount(r.Context(),
+			"SELECT max(report_period) FROM "+book, nil, &latest); err != nil {
+			a.thirteenFailed(w, "owners", err)
+			return
+		}
+		if latest.Valid {
+			period = formatPeriod(latest.Time)
+		}
+	}
+	// A lake with nothing in it has no quarter to answer for, and the panel says
+	// so rather than failing on a null date.
+	if period == "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"symbol": symbol, "period": "", "limit": limit,
+			"total": 0, "holders": []OwnerRow{}, "summary": OwnerSummary{},
+		})
+		return
+	}
+
+	// One argument list per side of the query below: the cost-basis aggregate
+	// filters the same tickers through the same period the roster does.
+	args := append(append([]any{}, tickers...), period)
+	roster := fmt.Sprintf(`SELECT h.cik, COALESCE(n.filer_name, ''), h.shares, h.value_usd,
+			h.portfolio_weight_pct, COALESCE(f.action, ''), COALESCE(f.delta_shares, 0),
+			COALESCE(f.delta_weight_pct, 0), COALESCE(f.split_adjusted, false),
+			COALESCE(p.buy_quarters, 0), COALESCE(p.bought_shares, 0), p.est_cost_per_share
+		FROM %s h
+		LEFT JOIN %s n ON n.cik = h.cik
+		LEFT JOIN %s f
+			ON f.cik = h.cik AND f.report_period = h.report_period AND f.cusip = h.cusip
+		LEFT JOIN (
+			SELECT cik, count(*) AS buy_quarters, SUM(delta_shares) AS bought_shares,
+				ROUND(SUM(delta_shares * cur_vwap) / NULLIF(SUM(delta_shares), 0), 4)
+					AS est_cost_per_share
+			FROM %s
+			WHERE ticker %s AND report_period <= ? AND action IN ('NEW', 'ADDED')
+				AND cur_vwap IS NOT NULL
+			GROUP BY cik
+		) p ON p.cik = h.cik
+		WHERE h.ticker %s AND h.report_period = ?
+		ORDER BY h.portfolio_weight_pct DESC, h.value_usd DESC, h.cik
+		LIMIT %d`,
+		book, thirteenFrom(funds), flowFrom, pnlFrom, in, in, limit)
+	rosterArgs := append(append([]any{}, args...), args...)
+
+	holders := []OwnerRow{}
+	err := a.thirteenRows(r.Context(), roster, rosterArgs, func(rs *sql.Rows) error {
+		var row OwnerRow
+		if err := rs.Scan(&row.Cik, &row.FilerName, &row.Shares, &row.ValueUSD, &row.WeightPct,
+			&row.Action, &row.DeltaShares, &row.DeltaWeightPct, &row.SplitAdjusted,
+			&row.BuyQuarters, &row.BoughtShares, &row.EstCostPerShare); err != nil {
+			return err
+		}
+		if row.EstCostPerShare != nil {
+			basis := *row.EstCostPerShare * row.Shares
+			row.EstCostUSD = &basis
+		}
+		holders = append(holders, row)
+		return nil
+	})
+	if err != nil {
+		a.thirteenFailed(w, "owners", err)
+		return
+	}
+
+	summary := OwnerSummary{}
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT count(*),
+			COALESCE(SUM(h.shares), 0), COALESCE(SUM(h.value_usd), 0)
+		FROM %s h WHERE h.ticker %s AND h.report_period = ?`, book, in), args,
+		func(rs *sql.Rows) error {
+			return rs.Scan(&summary.Holders, &summary.Shares, &summary.ValueUSD)
+		}); err != nil {
+		a.thirteenFailed(w, "owners", err)
+		return
+	}
+
+	// The cohort's own book for the quarter: one row per filing, because the
+	// positions of a filing each carry its portfolio total.
+	if err := a.thirteenCount(r.Context(), fmt.Sprintf(`SELECT COALESCE(SUM(value), 0) FROM (
+			SELECT DISTINCT cik, portfolio_value_total AS value FROM %s WHERE report_period = ?)`,
+		book), []any{period}, &summary.TrackedAumUSD); err != nil {
+		a.thirteenFailed(w, "owners", err)
+		return
+	}
+	if summary.TrackedAumUSD > 0 {
+		summary.AumPct = 100 * summary.ValueUSD / summary.TrackedAumUSD
+	}
+
+	// The quarter's flow across the whole cohort, which is not the roster's total:
+	// a fund that left the name has a flow row with no position and belongs in the
+	// net, and a fund that filed for the first time this quarter has neither.
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT
+			count(*) FILTER (WHERE action IN ('NEW', 'ADDED')),
+			count(*) FILTER (WHERE action IN ('TRIMMED', 'EXITED')),
+			count(*) FILTER (WHERE action = 'EXITED'),
+			COALESCE(SUM(delta_shares) FILTER (WHERE delta_shares > 0), 0),
+			COALESCE(-SUM(delta_shares) FILTER (WHERE delta_shares < 0), 0),
+			COALESCE(SUM(delta_shares), 0)
+		FROM %s WHERE ticker %s AND report_period = ?`, flowFrom, in), args,
+		func(rs *sql.Rows) error {
+			return rs.Scan(&summary.BuyingFunds, &summary.SellingFunds, &summary.Exits,
+				&summary.BoughtShares, &summary.SoldShares, &summary.NetShares)
+		}); err != nil {
+		a.thirteenFailed(w, "owners", err)
+		return
+	}
+
+	for _, holder := range holders {
+		if holder.EstCostPerShare == nil {
+			summary.UnpricedFunds++
+		}
+	}
+	// The denominator comes from the market half of the app, which is the point of
+	// this panel; a symbol the dataset has no count for keeps the badge empty
+	// rather than dividing by a guess.
+	if outstanding, ok := a.dataset.SharesOutstanding(r.Context(), symbol, period); ok {
+		summary.OutstandingShares = outstanding
+		owned := 100 * summary.Shares / float64(outstanding)
+		summary.OwnedPct = &owned
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"symbol": symbol, "period": period, "limit": limit,
+		"total": summary.Holders, "summary": summary, "holders": holders,
 	})
 }
 

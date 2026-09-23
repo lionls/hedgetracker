@@ -166,6 +166,17 @@ export function thirteenFlow(cik, period = '') {
   return getJSON(`/13f/flow?${query({ cik, period })}`);
 }
 
+// thirteenOwners answers the stocks page's ownership panel: the tracked funds
+// holding one ticker in one quarter, largest position first, with the summary
+// its badges show. An empty period is the newest quarter the lake holds, which
+// is what the panel asks for, and a symbol no tracked fund owns answers with an
+// empty roster rather than an error. The market dataset has no bearing on the
+// match, so the panel passes the page's symbol and the server also tries the
+// lake's spelling of a share class (BRK-B against BRKB).
+export function thirteenOwners(ticker, period = '') {
+  return getJSON(`/13f/owners?${query({ ticker, period })}`);
+}
+
 // thirteenRefresh answers 202 when it started a build and 409 when one is
 // already running. Both bodies are the status, and both are states the
 // dashboard renders rather than errors, so neither is thrown: the status it
