@@ -67,8 +67,11 @@ body {
   border-color: #3d4a5c;
 }
 
+/* Eight page links need two rows of the 320px sidebar, and a row that overflows
+   it lands under the main panel, where the links cannot be clicked. */
 .pages {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   padding: 0 14px 12px;
 }
