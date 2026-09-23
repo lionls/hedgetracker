@@ -203,8 +203,12 @@ export default function Overlap() {
     ? [answer.a, answer.b].filter((side) => !side.inPeriod).map(fundName)
     : [];
   const compared = Boolean(answer && answer.period !== '' && absent.length === 0);
+  // The circles need a value for each book and a price for what the two share: a
+  // side the filing left unvalued has no size, and a shared set nothing could be
+  // priced for has no overlap area, so the picture would be a claim no filing
+  // made. The figures beside the picture are the filings' own either way.
   const shape =
-    compared && sideA.valueUsd > 0 && sideB.valueUsd > 0
+    compared && sideA.valueUsd > 0 && sideB.valueUsd > 0 && overlap.sharedValueUsd != null
       ? venn(sideA.valueUsd, sideB.valueUsd, overlap.sharedValueUsd)
       : null;
 
@@ -362,8 +366,9 @@ export default function Overlap() {
                     </svg>
                   ) : (
                     <p className="muted">
-                      One of the two books reports no value at {period(answer.period)}, so there is
-                      no circle to draw: the figures beside this line are still the filings&apos; own.
+                      The books cannot be drawn at {period(answer.period)}: a side of the comparison,
+                      or the positions the two share, is one the filing states no value for. The
+                      figures beside this line are still the filings&apos; own.
                     </p>
                   )}
                   <dl className="figures">
@@ -487,7 +492,9 @@ export default function Overlap() {
                         </td>
                         <td>{percent(row.bWeightPct)}</td>
                         <td title="the smaller of the two values in this position — the part both funds hold">
-                          {dollars(Math.min(row.aValueUsd, row.bValueUsd))}
+                          {row.aValueUsd === null || row.bValueUsd === null
+                            ? '—'
+                            : dollars(Math.min(row.aValueUsd, row.bValueUsd))}
                         </td>
                         <td>
                           <Badge
@@ -665,8 +672,10 @@ export default function Overlap() {
                   A 13F reports long positions only, so there is no short book anywhere on this page
                   — a TRIMMED or EXITED side is that fund&apos;s own sale of its own shares, never a
                   short. A position a side exited has no row in that quarter&apos;s book, so its
-                  shares, value and weight read zero there while the move stays in the record; rows
-                  are ranked by how much of a book each side moved.
+                  shares, value and weight read zero there while the move stays in the record; a side
+                  that held the position but filed no share count or value for it shows a dash
+                  instead, because the filing stated nothing to size. Rows are ranked by how much of
+                  a book each side moved.
                 </p>
               </>
             )}

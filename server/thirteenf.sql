@@ -156,9 +156,15 @@ GROUP BY cik, report_period, cusip;
 CREATE OR REPLACE VIEW security_names AS
 SELECT
   cusip,
-  arg_max(nameOfIssuer, value)                         AS issuer,
-  arg_max(titleOfClass, value)                         AS class_title,
-  COALESCE(NULLIF(arg_max(ticker, value), ''), cusip)  AS ticker
+  -- The names are read off the filing that reported the position at the largest
+  -- value. A null value is nothing to rank on: a CUSIP that only filings which
+  -- stated no value ever reported would roll the names up to null, and the
+  -- ticker to the CUSIP fallback a security with no ticker gets - losing names
+  -- the lake does carry. Ranking a value the lake never stated as zero keeps
+  -- the ordering of every filing that did state one, and returns the names.
+  arg_max(nameOfIssuer, COALESCE(value, 0))                       AS issuer,
+  arg_max(titleOfClass, COALESCE(value, 0))                       AS class_title,
+  COALESCE(NULLIF(arg_max(ticker, COALESCE(value, 0)), ''), cusip) AS ticker
 FROM raw_holdings
 WHERE putCall IS NULL
 GROUP BY cusip;

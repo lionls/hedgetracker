@@ -42,7 +42,13 @@ function basisTitle(holder) {
   if (holder.estCostPerShare === null) {
     return "nothing to price it from: the fund filed no purchase of this position in the quarters the lake covers, or no market VWAP for them";
   }
-  const filed = holder.shares ? holder.valueUsd / holder.shares : 0;
+  // The estimate only has a filing price to sit beside when the filing stated
+  // both a share count and a value: where it stated neither, or a count of zero,
+  // the tooltip says that rather than dividing by a count the filing never gave.
+  if (!holder.shares || holder.valueUsd === null) {
+    return `${count(holder.estCostPerShare)} a share: the average VWAP of the ${plural(holder.buyQuarters, 'quarter')} this fund bought in, which the filing's own figures leave nothing to set against`;
+  }
+  const filed = holder.valueUsd / holder.shares;
   return `${count(holder.estCostPerShare)} a share: the average VWAP of the ${plural(holder.buyQuarters, 'quarter')} this fund bought in, against the ${count(filed)} a share the filing values the position at`;
 }
 
