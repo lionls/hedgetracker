@@ -35,16 +35,19 @@ import (
 	"time"
 )
 
-// HoldingRow is one position of one filer in one quarter.
+// HoldingRow is one position of one filer in one quarter. shares, valueUsd and
+// weightPct are null for a filing that stated neither a value nor a share count
+// — the lake keeps a 13F's optional elements null rather than zeroing them — and
+// issuer is empty for a filing that named nothing: a reader shows the ticker.
 type HoldingRow struct {
-	Cusip         string  `json:"cusip"`
-	Ticker        string  `json:"ticker"`
-	Issuer        string  `json:"issuer"`
-	ClassTitle    string  `json:"classTitle,omitempty"`
-	Shares        float64 `json:"shares"`
-	ValueUSD      float64 `json:"valueUsd"`
-	WeightPct     float64 `json:"weightPct"`
-	ReportedLines int64   `json:"reportedLines"`
+	Cusip         string   `json:"cusip"`
+	Ticker        string   `json:"ticker"`
+	Issuer        string   `json:"issuer"`
+	ClassTitle    string   `json:"classTitle,omitempty"`
+	Shares        *float64 `json:"shares"`
+	ValueUSD      *float64 `json:"valueUsd"`
+	WeightPct     *float64 `json:"weightPct"`
+	ReportedLines int64    `json:"reportedLines"`
 }
 
 // FlowRow is one position over two consecutive filings of a fund. The deltas come
@@ -89,12 +92,14 @@ type FundRow struct {
 	Cik string `json:"cik"`
 	// The fund's name as EDGAR states it, empty on a lake the extractor has not
 	// named; the picker falls back to the CIK.
-	FilerName       string  `json:"filerName"`
-	Quarters        int64   `json:"quarters"`
-	FirstPeriod     string  `json:"firstPeriod"`
-	LatestPeriod    string  `json:"latestPeriod"`
-	LatestValueUSD  float64 `json:"latestValueUsd"`
-	LatestPositions int64   `json:"latestPositions"`
+	FilerName string `json:"filerName"`
+	Quarters  int64  `json:"quarters"`
+	// The newest filing's portfolio; null when that filing reported no values,
+	// which the picker shows as a dash rather than as an empty book.
+	FirstPeriod     string   `json:"firstPeriod"`
+	LatestPeriod    string   `json:"latestPeriod"`
+	LatestValueUSD  *float64 `json:"latestValueUsd"`
+	LatestPositions int64    `json:"latestPositions"`
 }
 
 // VWAPRow is one quarter of price history for one ticker.
@@ -115,6 +120,8 @@ type VWAPRow struct {
 // what it moved, and what the marks did to it. The P&L columns are null both for
 // a filer's first filing in the lake — there is no previous filing to mark
 // against — and for a quarter whose positions the price dataset does not cover.
+// portfolioValueUsd is null for a filing that reported no values at all, which
+// is a filing the lake holds without a portfolio to state.
 type FundSeriesRow struct {
 	Period             string   `json:"period"`
 	ReportYear         int64    `json:"reportYear"`
@@ -122,7 +129,7 @@ type FundSeriesRow struct {
 	PrevPeriod         string   `json:"prevPeriod,omitempty"`
 	QuartersBetween    int64    `json:"quartersBetween"`
 	Positions          int64    `json:"positions"`
-	PortfolioValueUSD  float64  `json:"portfolioValueUsd"`
+	PortfolioValueUSD  *float64 `json:"portfolioValueUsd"`
 	MovedPositions     int64    `json:"movedPositions"`
 	PositionsWithPnl   int64    `json:"positionsWithPnl"`
 	PnlUSD             *float64 `json:"pnlUsd"`
@@ -182,11 +189,11 @@ const holdingSlices = 12
 // by value, with the weight the filing implies. It is the quarter the page is on,
 // which is what "current holdings" means for a 13F — the series is the charts.
 type FundHoldingRow struct {
-	Cusip     string  `json:"cusip"`
-	Ticker    string  `json:"ticker"`
-	Issuer    string  `json:"issuer"`
-	ValueUSD  float64 `json:"valueUsd"`
-	WeightPct float64 `json:"weightPct"`
+	Cusip     string   `json:"cusip"`
+	Ticker    string   `json:"ticker"`
+	Issuer    string   `json:"issuer"`
+	ValueUSD  *float64 `json:"valueUsd"`
+	WeightPct *float64 `json:"weightPct"`
 }
 
 // FundHoldings is the quarter's book as the holdings panel needs it: the largest
@@ -195,11 +202,12 @@ type FundHoldingRow struct {
 // holdings_normalized rather than the movement rows, because a position the fund
 // exited is a row of position_quarter_pnl with nothing left in it and a book does
 // not hold those — which is also why positions and the series row's `positions`
-// are the same number.
+// are the same number. valueUsd is null for a book whose filing reported no
+// values: an unstated portfolio is not a portfolio worth nothing.
 type FundHoldings struct {
 	Largest   []FundHoldingRow `json:"largest"`
 	Positions int64            `json:"positions"`
-	ValueUSD  float64          `json:"valueUsd"`
+	ValueUSD  *float64         `json:"valueUsd"`
 }
 
 // flowSlices is how many positions each side of the flow diagram names: the
@@ -358,8 +366,8 @@ func (a *API) thirteenfHoldings(w http.ResponseWriter, r *http.Request) {
 	}
 	args := []any{cik, period}
 
-	query := fmt.Sprintf(`SELECT cusip, ticker, issuer, class_title, shares, value_usd,
-			portfolio_weight_pct, reported_lines
+	query := fmt.Sprintf(`SELECT cusip, ticker, COALESCE(issuer, ''), COALESCE(class_title, ''),
+			shares, value_usd, portfolio_weight_pct, reported_lines
 		FROM %s WHERE cik = ? AND report_period = ? ORDER BY value_usd DESC LIMIT %d`, from, limit)
 	holdings := []HoldingRow{}
 	if err := a.thirteenRows(r.Context(), query, args, func(rs *sql.Rows) error {
@@ -381,7 +389,9 @@ func (a *API) thirteenfHoldings(w http.ResponseWriter, r *http.Request) {
 		a.thirteenFailed(w, "holdings", err)
 		return
 	}
-	var value float64
+	// The portfolio total of the filing, null when it stated no values at all;
+	// the panel prints the dash rather than a zero the filing never filed.
+	var value *float64
 	if err := a.thirteenCount(r.Context(),
 		fmt.Sprintf("SELECT max(portfolio_value_total) FROM %s WHERE cik = ? AND report_period = ?", from), args, &value); err != nil {
 		a.thirteenFailed(w, "holdings", err)
@@ -731,7 +741,8 @@ func (a *API) thirteenfFund(w http.ResponseWriter, r *http.Request) {
 	// is this one fund's positions: a window over every fund's marks is the state
 	// the build's memory limit rules out. The subquery renames its key so the
 	// ranking below can go on naming bare columns.
-	positionsQuery := fmt.Sprintf(`SELECT p.cusip, p.ticker, p.issuer, p.action, p.shares, p.value_usd,
+	positionsQuery := fmt.Sprintf(`SELECT p.cusip, p.ticker, COALESCE(p.issuer, ''), p.action,
+			p.shares, p.value_usd,
 			p.portfolio_weight_pct, p.prev_shares, p.delta_shares, p.delta_value_usd, p.quarters_between,
 			p.split_factor, p.split_adjusted, p.prev_vwap, p.cur_vwap, p.pnl_usd, p.pnl_pct, p.priced,
 			cumulative.cumulative_pnl_usd
@@ -773,7 +784,8 @@ func (a *API) thirteenfFund(w http.ResponseWriter, r *http.Request) {
 	// rows — an exited position is a row of those with nothing left in it — and
 	// it needs them whole rather than as the page of rows the table asked for,
 	// because a ranking is not a composition.
-	largestQuery := fmt.Sprintf(`SELECT cusip, ticker, issuer, value_usd, portfolio_weight_pct
+	largestQuery := fmt.Sprintf(`SELECT cusip, ticker, COALESCE(issuer, ''), value_usd,
+			portfolio_weight_pct
 		FROM %s WHERE cik = ? AND report_period = ? ORDER BY value_usd DESC, cusip LIMIT %d`,
 		bookFrom, holdingSlices)
 	holdings := FundHoldings{Largest: []FundHoldingRow{}}
@@ -794,8 +806,10 @@ func (a *API) thirteenfFund(w http.ResponseWriter, r *http.Request) {
 		a.thirteenFailed(w, "fund", err)
 		return
 	}
+	// Summed without a COALESCE: a book whose filing stated no values has no
+	// total, which the panel shows as a dash rather than as a book worth nothing.
 	if err := a.thirteenCount(r.Context(),
-		fmt.Sprintf("SELECT COALESCE(SUM(value_usd), 0) FROM %s WHERE cik = ? AND report_period = ?", bookFrom),
+		fmt.Sprintf("SELECT SUM(value_usd) FROM %s WHERE cik = ? AND report_period = ?", bookFrom),
 		[]any{cik, period}, &holdings.ValueUSD); err != nil {
 		a.thirteenFailed(w, "fund", err)
 		return
@@ -1018,15 +1032,18 @@ const ownerSlices = 100
 // the quarters the fund bought this position at, over the window the lake covers
 // and ignoring what it sold. estCostPerShare is that average, estCostUsd the same
 // average applied to the shares held now — the basis of the position as it stands
-// — and both are null for a fund that only held. `action` is empty, not HELD,
-// when the fund's first filing in the lake is this quarter: there is no previous
-// filing to compare against rather than no move.
+// — and both are null for a fund that only held, or for a filing that stated no
+// share count to apply the average to. `action` is empty, not HELD, when the
+// fund's first filing in the lake is this quarter: there is no previous filing
+// to compare against rather than no move. shares, valueUsd and weightPct are null
+// for a filing that stated no share count or value, which is a filing the lake
+// holds without the figures.
 type OwnerRow struct {
 	Cik             string   `json:"cik"`
 	FilerName       string   `json:"filerName"`
-	Shares          float64  `json:"shares"`
-	ValueUSD        float64  `json:"valueUsd"`
-	WeightPct       float64  `json:"weightPct"`
+	Shares          *float64 `json:"shares"`
+	ValueUSD        *float64 `json:"valueUsd"`
+	WeightPct       *float64 `json:"weightPct"`
 	Action          string   `json:"action"`
 	DeltaShares     float64  `json:"deltaShares"`
 	DeltaWeightPct  float64  `json:"deltaWeightPct"`
@@ -1042,16 +1059,18 @@ type OwnerRow struct {
 // moved them. shares and valueUsd are the roster's holdings — the funds that
 // still hold the name — while netShares is the quarter's flow across every fund
 // in the lake, an exit included, so a name the whole cohort left is a negative
-// flow with an empty roster. ownedPct divides the filed shares by the share count
+// flow with an empty roster. The three of them are null when no filing in the
+// roster or the cohort stated the figures: a sum of filings that reported no
+// values is not a zero. ownedPct divides the filed shares by the share count
 // the market dataset reports for the quarter: that table carries shares
 // outstanding, not float, so the panel names what it divides by. outstandingShares
 // and ownedPct are absent when the dataset has no count for the symbol.
 type OwnerSummary struct {
 	Holders           int64    `json:"holders"`
-	Shares            float64  `json:"shares"`
-	ValueUSD          float64  `json:"valueUsd"`
-	TrackedAumUSD     float64  `json:"trackedAumUsd"`
-	AumPct            float64  `json:"aumPct"`
+	Shares            *float64 `json:"shares"`
+	ValueUSD          *float64 `json:"valueUsd"`
+	TrackedAumUSD     *float64 `json:"trackedAumUsd"`
+	AumPct            *float64 `json:"aumPct"`
 	OutstandingShares int64    `json:"outstandingShares,omitempty"`
 	OwnedPct          *float64 `json:"ownedPct"`
 	BoughtShares      float64  `json:"boughtShares"`
@@ -1166,8 +1185,8 @@ func (a *API) thirteenfOwners(w http.ResponseWriter, r *http.Request) {
 			&row.BuyQuarters, &row.BoughtShares, &row.EstCostPerShare); err != nil {
 			return err
 		}
-		if row.EstCostPerShare != nil {
-			basis := *row.EstCostPerShare * row.Shares
+		if row.EstCostPerShare != nil && row.Shares != nil {
+			basis := *row.EstCostPerShare * *row.Shares
 			row.EstCostUSD = &basis
 		}
 		holders = append(holders, row)
@@ -1180,7 +1199,7 @@ func (a *API) thirteenfOwners(w http.ResponseWriter, r *http.Request) {
 
 	summary := OwnerSummary{}
 	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT count(*),
-			COALESCE(SUM(h.shares), 0), COALESCE(SUM(h.value_usd), 0)
+			SUM(h.shares), SUM(h.value_usd)
 		FROM %s h WHERE h.ticker %s AND h.report_period = ?`, book, in), args,
 		func(rs *sql.Rows) error {
 			return rs.Scan(&summary.Holders, &summary.Shares, &summary.ValueUSD)
@@ -1190,15 +1209,17 @@ func (a *API) thirteenfOwners(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The cohort's own book for the quarter: one row per filing, because the
-	// positions of a filing each carry its portfolio total.
-	if err := a.thirteenCount(r.Context(), fmt.Sprintf(`SELECT COALESCE(SUM(value), 0) FROM (
+	// positions of a filing each carry its portfolio total. Null when no filing
+	// in the quarter stated a value, which is a cohort this panel cannot size.
+	if err := a.thirteenCount(r.Context(), fmt.Sprintf(`SELECT SUM(value) FROM (
 			SELECT DISTINCT cik, portfolio_value_total AS value FROM %s WHERE report_period = ?)`,
 		book), []any{period}, &summary.TrackedAumUSD); err != nil {
 		a.thirteenFailed(w, "owners", err)
 		return
 	}
-	if summary.TrackedAumUSD > 0 {
-		summary.AumPct = 100 * summary.ValueUSD / summary.TrackedAumUSD
+	if summary.ValueUSD != nil && summary.TrackedAumUSD != nil && *summary.TrackedAumUSD > 0 {
+		share := 100 * *summary.ValueUSD / *summary.TrackedAumUSD
+		summary.AumPct = &share
 	}
 
 	// The quarter's flow across the whole cohort, which is not the roster's total:
@@ -1221,17 +1242,20 @@ func (a *API) thirteenfOwners(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, holder := range holders {
-		if holder.EstCostPerShare == nil {
+		if holder.EstCostUSD == nil {
 			summary.UnpricedFunds++
 		}
 	}
 	// The denominator comes from the market half of the app, which is the point of
 	// this panel; a symbol the dataset has no count for keeps the badge empty
-	// rather than dividing by a guess.
+	// rather than dividing by a guess, and a roster that stated no share count
+	// keeps it empty too.
 	if outstanding, ok := a.dataset.SharesOutstanding(r.Context(), symbol, period); ok {
 		summary.OutstandingShares = outstanding
-		owned := 100 * summary.Shares / float64(outstanding)
-		summary.OwnedPct = &owned
+		if summary.Shares != nil {
+			owned := 100 * *summary.Shares / float64(outstanding)
+			summary.OwnedPct = &owned
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -1316,13 +1340,14 @@ type NetVolumeRow struct {
 // denominator either source carries, not a share of a float. Both the count and
 // the share are absent when the dataset has no count for the symbol at that date,
 // and the share counts only the tracked funds, so it is what this lake sees and
-// not the company's whole register.
+// not the company's whole register. shares and valueUsd are null for a company
+// whose only filings in the quarter stated no share count or value.
 type CrowdedRow struct {
 	Ticker            string   `json:"ticker"`
 	Issuer            string   `json:"issuer"`
 	Funds             int64    `json:"funds"`
-	Shares            float64  `json:"shares"`
-	ValueUSD          float64  `json:"valueUsd"`
+	Shares            *float64 `json:"shares"`
+	ValueUSD          *float64 `json:"valueUsd"`
 	OutstandingShares int64    `json:"outstandingShares,omitempty"`
 	OwnedPct          *float64 `json:"ownedPct"`
 }
@@ -1434,7 +1459,7 @@ func (a *API) thirteenfConsensus(w http.ResponseWriter, r *http.Request) {
 	// position the fund's previous filing did not have, so the count of openings
 	// is the count of the funds that opened one.
 	accumulations := []AccumulationRow{}
-	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT ticker, arg_max(issuer, value_usd),
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT ticker, COALESCE(arg_max(issuer, value_usd), ''),
 			count(DISTINCT cik), SUM(shares), SUM(value_usd), SUM(est_capital_flow),
 			count(*) FILTER (WHERE est_capital_flow IS NULL), MAX(portfolio_weight_pct)
 		FROM %s WHERE report_period = ? AND action = 'NEW'
@@ -1458,7 +1483,7 @@ func (a *API) thirteenfConsensus(w http.ResponseWriter, r *http.Request) {
 	// shares and value are what the exits gave up, and the sales are that position
 	// marked at this quarter's VWAP.
 	liquidations := []LiquidationRow{}
-	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT ticker, arg_max(issuer, prev_value_usd),
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT ticker, COALESCE(arg_max(issuer, prev_value_usd), ''),
 			count(DISTINCT cik), SUM(prev_shares), SUM(prev_value_usd),
 			-SUM(est_capital_flow), count(*) FILTER (WHERE est_capital_flow IS NULL)
 		FROM %s WHERE report_period = ? AND action = 'EXITED'
@@ -1481,7 +1506,7 @@ func (a *API) thirteenfConsensus(w http.ResponseWriter, r *http.Request) {
 	// way: the sign is in the row, so the top of this list is the quarter's largest
 	// inflow and the bottom its largest outflow.
 	netVolume := []NetVolumeRow{}
-	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT ticker, arg_max(issuer, value_usd),
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT ticker, COALESCE(arg_max(issuer, value_usd), ''),
 			count(DISTINCT cik),
 			count(DISTINCT cik) FILTER (WHERE action IN ('NEW', 'ADDED')),
 			count(DISTINCT cik) FILTER (WHERE action IN ('TRIMMED', 'EXITED')),
@@ -1508,7 +1533,7 @@ func (a *API) thirteenfConsensus(w http.ResponseWriter, r *http.Request) {
 	// asked, and the ranking is by that share. A company the dataset cannot price
 	// a count for keeps a null share and sorts last.
 	crowded := []CrowdedRow{}
-	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT ticker, arg_max(issuer, value_usd),
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT ticker, COALESCE(arg_max(issuer, value_usd), ''),
 			count(DISTINCT cik), SUM(shares), SUM(value_usd)
 		FROM %s WHERE report_period = ?
 		GROUP BY ticker
@@ -1534,18 +1559,19 @@ func (a *API) thirteenfConsensus(w http.ResponseWriter, r *http.Request) {
 	}
 	for i := range crowded {
 		count, found := counts[marketKey(crowded[i].Ticker)]
-		if !found {
+		if !found || crowded[i].Shares == nil {
 			continue
 		}
 		crowded[i].OutstandingShares = count
-		owned := 100 * crowded[i].Shares / float64(count)
+		owned := 100 * *crowded[i].Shares / float64(count)
 		crowded[i].OwnedPct = &owned
 	}
 	sort.SliceStable(crowded, func(i, j int) bool {
 		left, right := crowded[i].OwnedPct, crowded[j].OwnedPct
 		switch {
 		case left == nil && right == nil:
-			return crowded[i].ValueUSD > crowded[j].ValueUSD
+			return crowded[i].ValueUSD != nil && crowded[j].ValueUSD != nil &&
+				*crowded[i].ValueUSD > *crowded[j].ValueUSD
 		case left == nil:
 			return false
 		case right == nil:
@@ -1592,12 +1618,15 @@ var leaderboardSorts = []struct{ name, order string }{
 // lake's newest quarter and "stale" otherwise, and quartersSinceLatest counts the
 // gap between the two.
 type LeaderboardRow struct {
-	Cik                 string   `json:"cik"`
-	FilerName           string   `json:"filerName"`
-	Quarters            int64    `json:"quarters"`
-	FirstPeriod         string   `json:"firstPeriod"`
-	LatestPeriod        string   `json:"latestPeriod"`
-	LatestValueUSD      float64  `json:"latestValueUsd"`
+	Cik          string `json:"cik"`
+	FilerName    string `json:"filerName"`
+	Quarters     int64  `json:"quarters"`
+	FirstPeriod  string `json:"firstPeriod"`
+	LatestPeriod string `json:"latestPeriod"`
+	// The newest filing's portfolio; null for a filing that reported no values,
+	// which is what the column shows as a dash. Every other figure here is an
+	// estimate from a filing that can be marked, or a count.
+	LatestValueUSD      *float64 `json:"latestValueUsd"`
 	LatestPositions     int64    `json:"latestPositions"`
 	Top10Pct            *float64 `json:"top10Pct"`
 	TurnoverPct         *float64 `json:"turnoverPct"`
@@ -1736,32 +1765,37 @@ func (a *API) thirteenfLeaderboard(w http.ResponseWriter, r *http.Request) {
 // CompareFund is one side of a comparison: the filer's newest filing in the lake
 // and what it filed at the quarter being compared. inPeriod is false when the
 // fund filed nothing that quarter — a hand-picked quarter can be one the other
-// side skipped — so a page can tell an empty book from an unread one.
+// side skipped — so a page can tell an empty book from an unread one. valueUsd is
+// null when the quarter's filing listed positions without values, which is a book
+// the lake holds but cannot price.
 type CompareFund struct {
-	Cik          string  `json:"cik"`
-	FilerName    string  `json:"filerName"`
-	Quarters     int64   `json:"quarters"`
-	LatestPeriod string  `json:"latestPeriod"`
-	Positions    int64   `json:"positions"`
-	ValueUSD     float64 `json:"valueUsd"`
-	InPeriod     bool    `json:"inPeriod"`
+	Cik          string   `json:"cik"`
+	FilerName    string   `json:"filerName"`
+	Quarters     int64    `json:"quarters"`
+	LatestPeriod string   `json:"latestPeriod"`
+	Positions    int64    `json:"positions"`
+	ValueUSD     *float64 `json:"valueUsd"`
+	InPeriod     bool     `json:"inPeriod"`
 }
 
 // CompareOverlap is the ground two books share: the positions in common, the
 // Jaccard similarity of the two books, and the capital each side holds in common
 // or alone. Positions are matched on CUSIP, which is the identity a filing uses;
 // sharedPositions counts the intersection and unionPositions the union, so
-// jaccardPct is the intersection over the union. sharedValueUsd is the sum of the
-// smaller value in each shared position — the part both funds hold — and the two
-// unique columns are each book minus that. A 13F is long-only, so what overlaps
-// is long positions: the lake holds no short book to compare.
+// jaccardPct is the intersection over the union — the counts are what a filing
+// always states, and they are why a pair whose values are missing still has an
+// overlap. sharedValueUsd is the sum of the smaller value in each shared position
+// where both sides stated one, so it is null when no shared position could be
+// priced, and the two unique columns are each book minus that, null where the
+// book's own total is unknown. A 13F is long-only, so what overlaps is long
+// positions: the lake holds no short book to compare.
 type CompareOverlap struct {
 	SharedPositions int64    `json:"sharedPositions"`
 	UnionPositions  int64    `json:"unionPositions"`
 	JaccardPct      float64  `json:"jaccardPct"`
-	SharedValueUSD  float64  `json:"sharedValueUsd"`
-	AOnlyValueUSD   float64  `json:"aOnlyValueUsd"`
-	BOnlyValueUSD   float64  `json:"bOnlyValueUsd"`
+	SharedValueUSD  *float64 `json:"sharedValueUsd"`
+	AOnlyValueUSD   *float64 `json:"aOnlyValueUsd"`
+	BOnlyValueUSD   *float64 `json:"bOnlyValueUsd"`
 	SharedPctOfA    *float64 `json:"sharedPctOfA"`
 	SharedPctOfB    *float64 `json:"sharedPctOfB"`
 }
@@ -1773,17 +1807,19 @@ type CompareOverlap struct {
 // estimate the ownership panel makes, and null for a fund that only held. buyer
 // names the side that added in a contrarian row ("a" or "b") and is empty in a
 // shared one. A position one side exited has no row in the quarter's book, so its
-// shares, value and weight are zero there while the move stays in the record.
+// shares, value and weight are zero there while the move stays in the record;
+// they are null instead where that side has a row but stated no share count or
+// value, which leaves the row with an action and nothing to size.
 type ComparePosition struct {
 	Cusip            string   `json:"cusip"`
 	Ticker           string   `json:"ticker"`
 	Issuer           string   `json:"issuer"`
-	AShares          float64  `json:"aShares"`
-	BShares          float64  `json:"bShares"`
-	AValueUSD        float64  `json:"aValueUsd"`
-	BValueUSD        float64  `json:"bValueUsd"`
-	AWeightPct       float64  `json:"aWeightPct"`
-	BWeightPct       float64  `json:"bWeightPct"`
+	AShares          *float64 `json:"aShares"`
+	BShares          *float64 `json:"bShares"`
+	AValueUSD        *float64 `json:"aValueUsd"`
+	BValueUSD        *float64 `json:"bValueUsd"`
+	AWeightPct       *float64 `json:"aWeightPct"`
+	BWeightPct       *float64 `json:"bWeightPct"`
 	AAction          string   `json:"aAction"`
 	BAction          string   `json:"bAction"`
 	ADeltaShares     float64  `json:"aDeltaShares"`
@@ -1913,20 +1949,26 @@ func (a *API) thirteenfCompare(w http.ResponseWriter, r *http.Request) {
 
 	totals := struct {
 		APositions, BPositions, SharedPositions, UnionPositions int64
-		SharedValue, AValue, BValue                             float64
+		SharedValue, AValue, BValue                             *float64
 	}{}
+	// The shared value of a position is the smaller of the two filings' values,
+	// and it is unknown while either side's is: DuckDB's LEAST skips a null
+	// instead of returning one, which would let one side's value stand in for a
+	// part both funds hold.
 	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`WITH a AS (
 			SELECT cusip, value_usd FROM %s WHERE cik = ? AND report_period = ?
 		), b AS (
 			SELECT cusip, value_usd FROM %s WHERE cik = ? AND report_period = ?
 		), shared AS (
-			SELECT a.cusip, LEAST(a.value_usd, b.value_usd) AS value FROM a JOIN b USING (cusip)
+			SELECT a.cusip, CASE WHEN a.value_usd IS NULL OR b.value_usd IS NULL THEN NULL
+				ELSE LEAST(a.value_usd, b.value_usd) END AS value
+			FROM a JOIN b USING (cusip)
 		)
 		SELECT (SELECT count(*) FROM a), (SELECT count(*) FROM b), (SELECT count(*) FROM shared),
 			(SELECT count(*) FROM (SELECT cusip FROM a UNION SELECT cusip FROM b)),
-			(SELECT COALESCE(SUM(value), 0) FROM shared),
-			(SELECT COALESCE(SUM(value_usd), 0) FROM a),
-			(SELECT COALESCE(SUM(value_usd), 0) FROM b)`, book, book),
+			(SELECT SUM(value) FROM shared),
+			(SELECT SUM(value_usd) FROM a),
+			(SELECT SUM(value_usd) FROM b)`, book, book),
 		[]any{aCik, period, bCik, period}, func(rs *sql.Rows) error {
 			return rs.Scan(&totals.APositions, &totals.BPositions, &totals.SharedPositions,
 				&totals.UnionPositions, &totals.SharedValue, &totals.AValue, &totals.BValue)
@@ -1934,22 +1976,32 @@ func (a *API) thirteenfCompare(w http.ResponseWriter, r *http.Request) {
 		a.thirteenFailed(w, "compare", err)
 		return
 	}
+	// A book minus what the two hold in common: the difference needs both
+	// numbers, so a side of the comparison that filed no values has no
+	// alone-value either.
+	difference := func(whole, shared *float64) *float64 {
+		if whole == nil || shared == nil {
+			return nil
+		}
+		value := *whole - *shared
+		return &value
+	}
 	overlap := CompareOverlap{
 		SharedPositions: totals.SharedPositions,
 		UnionPositions:  totals.UnionPositions,
 		SharedValueUSD:  totals.SharedValue,
-		AOnlyValueUSD:   totals.AValue - totals.SharedValue,
-		BOnlyValueUSD:   totals.BValue - totals.SharedValue,
+		AOnlyValueUSD:   difference(totals.AValue, totals.SharedValue),
+		BOnlyValueUSD:   difference(totals.BValue, totals.SharedValue),
 	}
 	if totals.UnionPositions > 0 {
 		overlap.JaccardPct = 100 * float64(totals.SharedPositions) / float64(totals.UnionPositions)
 	}
-	if totals.AValue > 0 {
-		share := 100 * totals.SharedValue / totals.AValue
+	if totals.AValue != nil && totals.SharedValue != nil && *totals.AValue > 0 {
+		share := 100 * *totals.SharedValue / *totals.AValue
 		overlap.SharedPctOfA = &share
 	}
-	if totals.BValue > 0 {
-		share := 100 * totals.SharedValue / totals.BValue
+	if totals.BValue != nil && totals.SharedValue != nil && *totals.BValue > 0 {
+		share := 100 * *totals.SharedValue / *totals.BValue
 		overlap.SharedPctOfB = &share
 	}
 	for _, side := range []*CompareFund{sides[aCik], sides[bCik]} {
@@ -1965,7 +2017,8 @@ func (a *API) thirteenfCompare(w http.ResponseWriter, r *http.Request) {
 	// whichever fund holds more of it: a name is high conviction if it is a large
 	// part of either book.
 	shared := []ComparePosition{}
-	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT a.cusip, a.ticker, a.issuer,
+	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT a.cusip, a.ticker,
+			COALESCE(a.issuer, fa.issuer, ''),
 			a.shares, b.shares, a.value_usd, b.value_usd,
 			a.portfolio_weight_pct, b.portfolio_weight_pct,
 			COALESCE(fa.action, ''), COALESCE(fb.action, ''),
@@ -2000,10 +2053,13 @@ func (a *API) thirteenfCompare(w http.ResponseWriter, r *http.Request) {
 	// both funds feel strongest comes first.
 	contrarian := []ComparePosition{}
 	if err := a.thirteenRows(r.Context(), fmt.Sprintf(`SELECT fa.cusip, COALESCE(a.ticker, fa.ticker),
-			COALESCE(a.issuer, fa.issuer),
-			COALESCE(a.shares, 0), COALESCE(b.shares, 0),
-			COALESCE(a.value_usd, 0), COALESCE(b.value_usd, 0),
-			COALESCE(a.portfolio_weight_pct, 0), COALESCE(b.portfolio_weight_pct, 0),
+			COALESCE(a.issuer, fa.issuer, ''),
+			CASE WHEN a.cusip IS NULL THEN 0 ELSE a.shares END,
+			CASE WHEN b.cusip IS NULL THEN 0 ELSE b.shares END,
+			CASE WHEN a.cusip IS NULL THEN 0 ELSE a.value_usd END,
+			CASE WHEN b.cusip IS NULL THEN 0 ELSE b.value_usd END,
+			CASE WHEN a.cusip IS NULL THEN 0 ELSE a.portfolio_weight_pct END,
+			CASE WHEN b.cusip IS NULL THEN 0 ELSE b.portfolio_weight_pct END,
 			fa.action, fb.action,
 			COALESCE(fa.delta_shares, 0), COALESCE(fb.delta_shares, 0),
 			COALESCE(fa.delta_weight_pct, 0), COALESCE(fb.delta_weight_pct, 0),

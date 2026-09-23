@@ -37,16 +37,25 @@ const GAP = 1.5;
 // holds and how spread it is before a legend row is read.
 export default function HoldingsPie({ holdings }) {
   const largest = holdings?.largest || [];
-  const total = holdings?.valueUsd || 0;
   const positions = holdings?.positions || 0;
-  if (largest.length === 0 || total <= 0) {
+  // The ring can only draw a position the filing put a value on, because an arc
+  // needs a size and a zero-size arc would claim the fund held nothing: a row
+  // with no value is left to the tail, which counts it without pricing it. A
+  // book whose values are all unstated has no ring to draw, and says that rather
+  // than drawing a filing worth nothing.
+  const valued = largest.filter((row) => typeof row.valueUsd === 'number');
+  const total = holdings?.valueUsd;
+  if (positions === 0) {
     return <p className="muted">this filing reports no positions</p>;
   }
+  if (typeof total !== 'number' || total <= 0 || valued.length === 0) {
+    return <p className="muted">this filing states no values for its positions</p>;
+  }
 
-  const drawn = largest.reduce((sum, row) => sum + row.valueUsd, 0);
-  const named = largest.reduce((sum, row) => sum + row.weightPct, 0);
+  const drawn = valued.reduce((sum, row) => sum + row.valueUsd, 0);
+  const named = valued.reduce((sum, row) => sum + row.weightPct, 0);
   const rest = Math.max(0, total - drawn);
-  const slices = largest.map((row, index) => ({
+  const slices = valued.map((row, index) => ({
     key: row.cusip,
     label: row.ticker || row.cusip,
     title: `${row.issuer} · ${percent(row.weightPct)} of the filing · ${dollars(row.valueUsd)}`,
@@ -55,7 +64,7 @@ export default function HoldingsPie({ holdings }) {
     color: COLORS[index % COLORS.length],
   }));
   if (rest > 0) {
-    const others = Math.max(0, positions - largest.length);
+    const others = Math.max(0, positions - valued.length);
     slices.push({
       key: 'rest',
       label: others > 0 ? `${count(others)} others` : 'the rest',
@@ -87,7 +96,7 @@ export default function HoldingsPie({ holdings }) {
             role="img"
             aria-label={`${plural(positions, 'position')}, ${dollars(
               total,
-            )} reported, the largest ${largest.length} of them named`}
+            )} reported, the largest ${valued.length} of them named`}
           >
             <circle
               className="donut-track"
