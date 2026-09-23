@@ -32,8 +32,10 @@ export default function ThirteenF() {
   const cik = fund?.cik || '';
 
   // Holdings own the quarter: an empty period asks for the filer's newest, and
-  // the response says which one that was. Both the headline and the two panels
-  // below read that answer rather than each deciding for themselves.
+  // the response says which one that was. The headline, the quarter selector and
+  // the two panels below read that answer rather than each deciding for
+  // themselves — the selector lists every quarter the filer filed, but the one it
+  // shows selected is the one being displayed.
   useEffect(() => {
     if (!cik) return undefined;
     let active = true;
@@ -124,7 +126,7 @@ export default function ThirteenF() {
           {quarters.length > 0 ? (
             <select
               className="control"
-              value={wanted || quarters[0] || ''}
+              value={wanted || holdings?.period || ''}
               title={`${quarters.length} quarters filed`}
               onChange={(event) => pickQuarter(event.target.value)}
             >
